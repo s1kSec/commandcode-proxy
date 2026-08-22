@@ -2234,7 +2234,86 @@ function isUsageRequestAllowed(req) {
   return configured.includes('*') || configured.includes(getRemoteAddress(req));
 }
 
-async function handleUsage(req, res) {
+function escapeHtml(value) {
+  return String(value).replace(/[&<>'"]/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
+}
+
+function formatCreditAmount(value) {
+  return Number.isFinite(value) ? `$${value.toFixed(2)}` : '—';
+}
+
+function formatResetAt(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return `重置于 ${date.toLocaleString('zh-CN', { hour12: false })}`;
+}
+
+function renderUsageMeter(label, window) {
+  if (!window || !Number.isFinite(window.used) || !Number.isFinite(window.cap) || window.cap <= 0) return '';
+  const percent = Math.min(100, Math.max(0, (window.used / window.cap) * 100));
+  const activeSegments = Math.ceil((percent / 100) * 24);
+  const tone = percent >= 90 ? 'danger' : percent >= 70 ? 'warning' : 'normal';
+  const segments = Array.from({ length: 24 }, (_, index) => `<span class="segment ${index < activeSegments ? 'active' : ''}"></span>`).join('');
+  return `<section class="meter ${tone}">
+    <div class="meter-heading"><h3>${escapeHtml(label)}</h3><strong>${percent.toFixed(1)}%</strong></div>
+    <div class="segments" role="progressbar" aria-label="${escapeHtml(label)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent.toFixed(1)}">${segments}</div>
+    <div class="meter-detail"><span>${formatCreditAmount(window.used)} / ${formatCreditAmount(window.cap)}</span><span>${escapeHtml(formatResetAt(window.resetAt))}</span></div>
+  </section>`;
+}
+
+function renderUsageDashboard(usages) {
+  const accountCards = usages.map(usage => {
+    const monthly = usage.monthly ? {
+      used: usage.monthly.used,
+      cap: usage.monthly.cap,
+      resetAt: usage.monthly.resetAt,
+    } : null;
+    const meters = [
+      renderUsageMeter('5-Hour limit', usage.fiveHour),
+      renderUsageMeter('Weekly limit', usage.weekly),
+      renderUsageMeter('Monthly limit', monthly),
+    ].filter(Boolean).join('');
+    const unavailable = meters || '<p class="empty">官方接口暂未返回可展示的额度窗口。</p>';
+    return `<article class="account-card">
+      <header><div><span class="eyebrow">ACCOUNT</span><h2>${escapeHtml(usage.id)}</h2></div><span class="status ${usage.status === 'ok' ? 'ok' : 'unavailable'}">${usage.status === 'ok' ? '已同步' : '暂不可用'}</span></header>
+      ${unavailable}
+    </article>`;
+  }).join('');
+
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Command Code 用量</title><style>
+  :root { color-scheme: dark; --bg:#050505; --panel:#090b0c; --line:#22282b; --text:#eef4f2; --muted:#91a09b; --track:#06271f; --active:#19d5a6; --warning:#f5ae2a; --danger:#ff5f57; }
+  * { box-sizing:border-box; } body { margin:0; min-width:320px; background:var(--bg); color:var(--text); font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
+  main { width:min(1180px,calc(100% - 32px)); margin:32px auto 48px; } .page-heading { display:flex; gap:16px; justify-content:space-between; align-items:end; margin-bottom:20px; } .eyebrow { color:#a879f7; font-size:12px; letter-spacing:.08em; } h1,h2,h3,p { margin:0; } h1 { font-size:26px; margin-top:6px; } .updated { color:var(--muted); font-size:12px; text-align:right; }
+  .account-grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); } .account-card { background:var(--panel); border:1px solid var(--line); padding:22px; min-width:0; } .account-card header { display:flex; justify-content:space-between; align-items:start; gap:14px; margin-bottom:22px; } h2 { font-size:19px; margin-top:6px; } .status { font-size:12px; white-space:nowrap; padding-top:4px; } .status.ok { color:var(--active); } .status.unavailable { color:var(--danger); }
+  .meter + .meter { margin-top:26px; } .meter-heading,.meter-detail { display:flex; justify-content:space-between; gap:12px; } .meter-heading { align-items:baseline; margin-bottom:10px; } h3 { font-size:13px; font-weight:500; letter-spacing:.04em; text-transform:uppercase; } .meter-heading strong { font-size:13px; color:var(--active); } .warning .meter-heading strong { color:var(--warning); } .danger .meter-heading strong { color:var(--danger); }
+  .segments { display:grid; grid-template-columns:repeat(24,minmax(0,1fr)); gap:3px; height:27px; } .segment { background:var(--track); } .segment.active { background:var(--active); } .warning .segment.active { background:var(--warning); } .danger .segment.active { background:var(--danger); } .meter-detail { color:var(--muted); font-size:11px; margin-top:8px; min-height:14px; } .empty { color:var(--muted); font-size:13px; padding:16px 0; }
+  @media (max-width:520px) { main { width:min(100% - 20px,1180px); margin-top:20px; } .page-heading { display:block; } .updated { text-align:left; margin-top:8px; } .account-grid { grid-template-columns:1fr; } .account-card { padding:18px; } .meter-detail { display:block; } .meter-detail span + span { display:block; margin-top:4px; } }
+</style></head><body><main>
+  <header class="page-heading"><div><span class="eyebrow">◉ USAGE LIMITS</span><h1>Command Code 账号用量</h1></div><p class="updated">更新于 ${escapeHtml(new Date().toLocaleString('zh-CN', { hour12: false }))}</p></header>
+  <section class="account-grid" aria-label="账号额度">${accountCards}</section>
+</main></body></html>`;
+}
+
+function clientWantsUsageHtml(req, url) {
+  if (url.searchParams.get('format') === 'json') return false;
+  return url.searchParams.get('format') === 'html' || String(req.headers.accept || '').includes('text/html');
+}
+
+function sendUsageHtml(res, usages) {
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  res.end(renderUsageDashboard(usages));
+}
+
+async function handleUsage(req, res, url) {
   if (!isUsageRequestAllowed(req)) {
     sendJSON(res, 403, { error: { message: 'Usage endpoint is restricted to configured source IPs', type: 'access_denied' } });
     return;
@@ -2246,15 +2325,20 @@ async function handleUsage(req, res) {
 
   // /usage 必须反映当前值，因此强制刷新；并发请求会共用同一轮上游查询。
   const usages = await refreshPoolUsage(true);
+  const accounts = ACCOUNT_POOL.accounts.map(account => usages.find(usage => usage?.id === account.id) || {
+    id: account.id,
+    status: 'unavailable',
+  });
+  if (clientWantsUsageHtml(req, url)) {
+    sendUsageHtml(res, accounts);
+    return;
+  }
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   sendJSON(res, 200, {
     object: 'account_pool_usage',
     fetchedAt: new Date().toISOString(),
-    accounts: ACCOUNT_POOL.accounts.map(account => usages.find(usage => usage?.id === account.id) || {
-      id: account.id,
-      status: 'unavailable',
-    }),
+    accounts,
   });
 }
 
@@ -2287,7 +2371,7 @@ const server = http.createServer(async (req, res) => {
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {
       await handleModels(req, res);
     } else if (url.pathname === '/usage' && req.method === 'GET') {
-      await handleUsage(req, res);
+      await handleUsage(req, res, url);
     } else if (url.pathname === '/health' || url.pathname === '/') {
       handleHealth(req, res);
     } else {

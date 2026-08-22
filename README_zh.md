@@ -270,10 +270,12 @@ data: {"type":"message_stop"}
 
 ### `GET /usage`
 
-只读、无需鉴权的账号池额度接口。返回每个配置账号的 `fiveHour`、`weekly`、`monthly` 当前已用额度、上限、剩余额度和重置时间；不会返回任何 API Key、邮箱、用户名或上游原始数据。
+只读、无需鉴权的账号池额度接口。在浏览器直接打开时会显示深色的可视化额度面板，每个账号仅展示官方实际返回的 5-Hour、Weekly、Monthly 额度；没有 Token 或窗口数据时不会伪造图表。不会返回任何 API Key、邮箱、用户名或上游原始数据。
 
 ```bash
-curl http://127.0.0.1:3050/usage
+# 浏览器：打开 http://127.0.0.1:3050/usage （或 ?format=html）
+# JSON（供脚本/监控使用）：
+curl 'http://127.0.0.1:3050/usage?format=json'
 ```
 
 ## 错误码
