@@ -6,7 +6,7 @@
   "projectSlug": "cc-proxy",
   "logFile": "",
   "logLevel": "info",
-  "usageAllowedIps": ["127.0.0.1", "::1"],
+  "usageAllowedIps": ["*"],
   "accountPool": {
     "enabled": false,
     "proxyKey": "replace-with-a-random-secret-at-least-24-characters",

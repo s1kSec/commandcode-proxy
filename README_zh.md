@@ -60,7 +60,7 @@ commandcode/
 | `logLevel` | `info` | 日志级别 |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
-| `usageAllowedIps` | `['127.0.0.1', '::1']` | 无鉴权 `/usage` 的允许来源 IP；不信任 `X-Forwarded-For` |
+| `usageAllowedIps` | `['*']` | 无鉴权 `/usage` 的允许来源 IP；`'*'` 表示允许所有容器/宿主机来源 |
 | `accountPool` | 见下文 | 多账号池；默认关闭，开启后用一个专属代理 Key 调用所有已启用账号 |
 
 ### 多账号池
@@ -85,7 +85,7 @@ commandcode/
 
 额度缓存默认每 60 秒刷新一次；每次访问 `/usage` 会强制刷新。账号 ID 只能使用字母、数字、点、下划线、连字符，且不得重复。真实 `user_` Key、用户资料和官方原始响应都不会出现在日志或 `/usage` 响应中。
 
-`/usage` 不需要任何 API Key，但默认只允许本机来源。若监控程序不在本机，请将其固定 IP 明确加入 `usageAllowedIps`，例如 `["127.0.0.1", "10.0.0.20"]`；不要使用 `0.0.0.0`、网段通配或反向代理提供的 `X-Forwarded-For` 作为信任依据。
+`/usage` 不需要任何 API Key，默认通过 `usageAllowedIps: ["*"]` 允许所有容器/宿主机来源。需要收紧访问范围时，将其改为固定 IP 列表，例如 `["127.0.0.1", "172.17.0.1", "10.0.0.20"]`；精确 IP 模式不信任反向代理提供的 `X-Forwarded-For`。
 
 ### 环境变量
 

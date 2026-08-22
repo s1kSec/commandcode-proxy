@@ -22,7 +22,7 @@ function loadConfig() {
     logLevel: 'info',
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
-    usageAllowedIps: ['127.0.0.1', '::1'],
+    usageAllowedIps: ['*'],
     accountPool: {
       enabled: false,
       proxyKey: '',
@@ -2201,9 +2201,10 @@ function getRemoteAddress(req) {
 }
 
 function isUsageRequestAllowed(req) {
-  const configured = Array.isArray(CFG.usageAllowedIps) ? CFG.usageAllowedIps : ['127.0.0.1', '::1'];
-  // 不信任 X-Forwarded-For，避免客户端伪造来源地址绕过这个无鉴权接口的访问控制。
-  return configured.includes(getRemoteAddress(req));
+  const configured = Array.isArray(CFG.usageAllowedIps) ? CFG.usageAllowedIps : ['*'];
+  // "*" 表示允许任意容器 / 宿主机来源；未配置时同样保持全允许。
+  // 未使用 X-Forwarded-For，避免精确 IP 模式被客户端伪造的头绕过。
+  return configured.includes('*') || configured.includes(getRemoteAddress(req));
 }
 
 async function handleUsage(req, res) {
