@@ -8,6 +8,7 @@ import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { isIP } from 'net';
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -32,13 +33,17 @@ function loadConfig() {
   };
 
   const configPath = resolve(__dirname, 'config.json');
-  if (existsSync(configPath)) {
-    try {
-      const user = JSON.parse(readFileSync(configPath, 'utf-8'));
-      Object.assign(defaults, user);
-    } catch (e) {
-      console.error('[config] Failed to parse config.json:', e.message);
+  if (!existsSync(configPath)) {
+    throw new Error(`[config] Required config.json was not found at ${configPath}. Mount it at this exact path before starting the proxy.`);
+  }
+  try {
+    const user = JSON.parse(readFileSync(configPath, 'utf-8'));
+    if (!user || typeof user !== 'object' || Array.isArray(user)) {
+      throw new Error('top-level JSON value must be an object');
     }
+    Object.assign(defaults, user);
+  } catch (e) {
+    throw new Error(`[config] Failed to load ${configPath}: ${e.message}`);
   }
 
   // 环境变量覆写
@@ -48,6 +53,17 @@ function loadConfig() {
   if (process.env.PROJECT_SLUG) defaults.projectSlug = process.env.PROJECT_SLUG;
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
+
+  try {
+    const apiBase = new URL(defaults.apiBase);
+    if (apiBase.protocol !== 'https:' && apiBase.protocol !== 'http:') throw new Error('must use http or https');
+    defaults.apiBase = apiBase.toString().replace(/\/$/, '');
+  } catch (e) {
+    throw new Error(`[config] apiBase must be a plain http(s) URL, not Markdown or other text: ${e.message}`);
+  }
+  if (!Array.isArray(defaults.usageAllowedIps) || defaults.usageAllowedIps.some(ip => typeof ip !== 'string' || (ip !== '*' && isIP(ip) === 0))) {
+    throw new Error('[config] usageAllowedIps must be an array containing "*" and/or literal IPv4/IPv6 addresses');
+  }
 
   return defaults;
 }
@@ -62,7 +78,10 @@ const MIN_POOL_PROXY_KEY_LENGTH = 24;
 const MAX_POOL_ACCOUNTS = 50;
 
 function normalizeAccountPool(rawPool) {
-  const raw = rawPool && typeof rawPool === 'object' && !Array.isArray(rawPool) ? rawPool : {};
+  if (rawPool === undefined || rawPool === null) return { enabled: false, accounts: [], proxyKey: '', usageRefreshIntervalMs: 60 * 1000 };
+  if (typeof rawPool !== 'object' || Array.isArray(rawPool)) throw new Error('accountPool must be an object');
+  const raw = rawPool;
+  if (typeof raw.enabled !== 'boolean') throw new Error('accountPool.enabled must be a boolean');
   if (raw.enabled !== true) return { enabled: false, accounts: [], proxyKey: '', usageRefreshIntervalMs: 60 * 1000 };
 
   if (typeof raw.proxyKey !== 'string' || raw.proxyKey.length < MIN_POOL_PROXY_KEY_LENGTH) {
@@ -95,7 +114,15 @@ function normalizeAccountPool(rawPool) {
   };
 }
 
-const ACCOUNT_POOL = normalizeAccountPool(CFG.accountPool);
+let ACCOUNT_POOL;
+try {
+  ACCOUNT_POOL = normalizeAccountPool(CFG.accountPool);
+  if (ACCOUNT_POOL.enabled) {
+    console.log(`[config] Account pool enabled with ${ACCOUNT_POOL.accounts.length} configured account(s)`);
+  }
+} catch (e) {
+  throw new Error(`[config] Invalid accountPool configuration: ${e.message}`);
+}
 
 // ── 指纹生成（首次运行自动生成，写回 config.json） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
@@ -273,7 +300,7 @@ function getOrCreateKeyState(apiKey) {
       nextInitAt: 0,
     };
     keyStateStore.set(apiKey, state);
-    log('info', 'Fingerprint generated for key', { keyPrefix: apiKey.slice(0, 8) });
+    log('info', 'Fingerprint generated for account');
   }
   return state;
 }

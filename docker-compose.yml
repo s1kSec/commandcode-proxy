@@ -1,8 +1,8 @@
-version: "3.9"
-
 services:
   proxy:
     build: .
+    volumes:
+      - ./config.json:/app/config.json:ro
     ports:
       - "${PROXY_PORT:-3050}:3050"
     environment:

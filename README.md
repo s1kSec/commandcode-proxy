@@ -428,6 +428,14 @@ The `latest` tag is updated on each release. The image is public — no login re
 docker compose up -d
 ```
 
+Compose bind-mounts the current directory's `config.json` read-only at `/app/config.json`. The proxy resolves this path relative to `proxy.mjs`, not the container's current working directory. Change accounts, keys, or quota settings without rebuilding the image, then restart the service:
+
+```bash
+docker compose restart proxy
+```
+
+If the configuration file is missing, invalid JSON, `accountPool.enabled` is not a boolean, or an enabled pool has duplicate IDs/invalid keys, startup logs a clear `[config]` error and exits instead of silently disabling the pool. `usageAllowedIps` accepts `"*"` (allow all) or literal IP addresses such as `"172.17.0.1"`; do not write it as `"\*"`, and do not put Markdown links in `apiBase`.
+
 The proxy will listen on `http://0.0.0.0:3050`. Set `PROXY_PORT` to customize the host port:
 
 ```bash
@@ -438,7 +446,9 @@ PROXY_PORT=13050 docker compose up -d
 
 ```bash
 docker build -t commandcode-proxy:latest .
-docker run -d -p 3050:3050 -e PORT=3050 commandcode-proxy:latest
+docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
+  --mount type=bind,src="$(pwd)/config.json",dst=/app/config.json,readonly \
+  commandcode-proxy:latest
 ```
 
 ### Multi-Architecture Build

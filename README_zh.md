@@ -464,6 +464,14 @@ docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/comman
 docker compose up -d
 ```
 
+Compose 会将当前目录的 `config.json` 以只读方式挂载到容器内 `/app/config.json`。代理实际按 `proxy.mjs` 所在目录读取该路径，不依赖容器的当前工作目录。修改账号池、Key 或额度相关配置后无需重新构建镜像，直接重启即可生效：
+
+```bash
+docker compose restart proxy
+```
+
+配置文件缺失、JSON 格式错误、`accountPool.enabled` 不是布尔值，或启用账号池后账号 ID 重复/Key 非法时，进程会在启动时输出明确的 `[config]` 错误并退出；不会静默回退到关闭账号池。`usageAllowedIps` 必须填写 `"*"`（允许全部）或字面量 IP，例如 `"172.17.0.1"`。不要写成 `"\*"`，也不要把 `apiBase` 写成 Markdown 链接。
+
 代理将在 `http://0.0.0.0:3050` 监听。通过 `PROXY_PORT` 自定义主机端口：
 
 ```bash
@@ -474,7 +482,9 @@ PROXY_PORT=13050 docker compose up -d
 
 ```bash
 docker build -t commandcode-proxy:latest .
-docker run -d -p 3050:3050 -e PORT=3050 commandcode-proxy:latest
+docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
+  --mount type=bind,src="$(pwd)/config.json",dst=/app/config.json,readonly \
+  commandcode-proxy:latest
 ```
 
 ### 多架构构建
