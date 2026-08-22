@@ -5,5 +5,15 @@
   "apiBase": "https://api.commandcode.ai",
   "projectSlug": "cc-proxy",
   "logFile": "",
-  "logLevel": "info"
+  "logLevel": "info",
+  "usageAllowedIps": ["127.0.0.1", "::1"],
+  "accountPool": {
+    "enabled": false,
+    "proxyKey": "replace-with-a-random-secret-at-least-24-characters",
+    "usageRefreshIntervalMs": 60000,
+    "accounts": [
+      { "id": "account-1", "apiKey": "user_replace_with_first_commandcode_key", "enabled": true },
+      { "id": "account-2", "apiKey": "user_replace_with_second_commandcode_key", "enabled": true }
+    ]
+  }
 }

@@ -22,6 +22,13 @@ function loadConfig() {
     logLevel: 'info',
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
+    usageAllowedIps: ['127.0.0.1', '::1'],
+    accountPool: {
+      enabled: false,
+      proxyKey: '',
+      usageRefreshIntervalMs: 60 * 1000,
+      accounts: [],
+    },
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -46,6 +53,49 @@ function loadConfig() {
 }
 
 const CFG = loadConfig();
+
+// ── 账号池配置 ─────────────────────────────────────
+// 账号池仅在客户端提供 accountPool.proxyKey 时启用；真实 Command Code Key 永不返回给客户端。
+const ACCOUNT_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const COMMAND_CODE_KEY_RE = /^user_[A-Za-z0-9_-]+$/;
+const MIN_POOL_PROXY_KEY_LENGTH = 24;
+const MAX_POOL_ACCOUNTS = 50;
+
+function normalizeAccountPool(rawPool) {
+  const raw = rawPool && typeof rawPool === 'object' && !Array.isArray(rawPool) ? rawPool : {};
+  if (raw.enabled !== true) return { enabled: false, accounts: [], proxyKey: '', usageRefreshIntervalMs: 60 * 1000 };
+
+  if (typeof raw.proxyKey !== 'string' || raw.proxyKey.length < MIN_POOL_PROXY_KEY_LENGTH) {
+    throw new Error(`accountPool.proxyKey must be a random secret of at least ${MIN_POOL_PROXY_KEY_LENGTH} characters`);
+  }
+  if (!Array.isArray(raw.accounts) || raw.accounts.length === 0 || raw.accounts.length > MAX_POOL_ACCOUNTS) {
+    throw new Error(`accountPool.accounts must contain between 1 and ${MAX_POOL_ACCOUNTS} accounts`);
+  }
+
+  const ids = new Set();
+  const accounts = raw.accounts.map((account, index) => {
+    if (!account || typeof account !== 'object' || !ACCOUNT_ID_RE.test(account.id || '')) {
+      throw new Error(`accountPool.accounts[${index}].id must match ${ACCOUNT_ID_RE}`);
+    }
+    if (ids.has(account.id)) throw new Error('accountPool account ids must be unique');
+    ids.add(account.id);
+    if (!COMMAND_CODE_KEY_RE.test(account.apiKey || '')) {
+      throw new Error(`accountPool.accounts[${index}].apiKey must be a Command Code user_ key`);
+    }
+    return { id: account.id, apiKey: account.apiKey, enabled: account.enabled !== false };
+  }).filter(account => account.enabled);
+
+  if (accounts.length === 0) throw new Error('accountPool must have at least one enabled account');
+  const interval = Number(raw.usageRefreshIntervalMs);
+  return {
+    enabled: true,
+    proxyKey: raw.proxyKey,
+    accounts,
+    usageRefreshIntervalMs: Number.isFinite(interval) ? Math.min(Math.max(interval, 15 * 1000), 15 * 60 * 1000) : 60 * 1000,
+  };
+}
+
+const ACCOUNT_POOL = normalizeAccountPool(CFG.accountPool);
 
 // ── 指纹生成（首次运行自动生成，写回 config.json） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
@@ -284,6 +334,263 @@ async function ensureInitialized(apiKey, signal) {
   } catch (e) {
     if (e.name !== 'AbortError') log('warn', 'Fingerprint/lifecycle refresh error, will retry next request', { error: e.message });
   }
+}
+
+// ── 账号池额度查询与切换 ─────────────────────────────
+// 这些是 Command Code CLI 自己使用的只读 billing 端点。上游原始响应可能含
+// 账户资料，因此只保留额度字段，绝不透传原始响应、账号 key 或用户名。
+const poolUsageStore = new Map(); // account id -> sanitized usage + availability state
+let poolCursor = 0;
+let poolUsageRefreshPromise = null;
+
+function timingSafeStringEqual(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function isPoolProxyKey(value) {
+  return ACCOUNT_POOL.enabled && timingSafeStringEqual(value, ACCOUNT_POOL.proxyKey);
+}
+
+function toFiniteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function toIsoDate(value) {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function normalizeUsageWindow(window) {
+  if (!window || typeof window !== 'object') return null;
+  const used = toFiniteNumber(window.used);
+  const cap = toFiniteNumber(window.cap);
+  const resetAt = toIsoDate(window.resetAt ?? window.reset_at ?? window.resetsAt ?? window.resets_at);
+  if (used === null && cap === null && !resetAt) return null;
+  return {
+    used: used === null ? null : Math.max(0, used),
+    cap: cap === null ? null : Math.max(0, cap),
+    remaining: used !== null && cap !== null ? Math.max(0, cap - used) : null,
+    resetAt,
+  };
+}
+
+const PLAN_MONTHLY_CREDITS = {
+  'individual-go': 10,
+  'individual-goat': 70,
+  'individual-pro': 30,
+  'individual-pro-v1': 80,
+  'individual-provider': 15,
+  'individual-max': 150,
+  'individual-ultra': 300,
+  'teams-pro': 40,
+};
+
+function getPlanMonthlyCredits(planId) {
+  if (typeof planId !== 'string') return null;
+  const normalized = planId.toLowerCase().replace(/_/g, '-');
+  const knownPlan = Object.keys(PLAN_MONTHLY_CREDITS).sort((a, b) => b.length - a.length)
+    .find(candidate => normalized.startsWith(candidate));
+  return knownPlan ? PLAN_MONTHLY_CREDITS[knownPlan] : null;
+}
+
+async function fetchUsageJson(path, apiKey) {
+  try {
+    const response = await fetch(`${CFG.apiBase}${path}`, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'x-cli-environment': 'production',
+        'x-command-code-version': CC_VERSION,
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) return { ok: false, status: response.status, data: null };
+    return { ok: true, status: response.status, data: await response.json() };
+  } catch {
+    return { ok: false, status: null, data: null };
+  }
+}
+
+function buildUsageQuery(path, params) {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== null && value !== undefined && value !== '') query.set(key, value);
+  }
+  const encoded = query.toString();
+  return encoded ? `${path}?${encoded}` : path;
+}
+
+async function refreshAccountUsage(account) {
+  const whoami = await fetchUsageJson('/alpha/whoami', account.apiKey);
+  const orgId = whoami.data?.org?.id ?? null;
+  const [creditsResponse, subscriptionResponse] = await Promise.all([
+    fetchUsageJson(buildUsageQuery('/alpha/billing/credits', { orgId }), account.apiKey),
+    fetchUsageJson(buildUsageQuery('/alpha/billing/subscriptions', { orgId }), account.apiKey),
+  ]);
+  const currentPeriodStart = subscriptionResponse.data?.data?.currentPeriodStart ?? null;
+  const summaryResponse = await fetchUsageJson(buildUsageQuery('/alpha/usage/summary', { orgId, since: currentPeriodStart }), account.apiKey);
+
+  const credits = creditsResponse.data?.credits ?? null;
+  const subscription = subscriptionResponse.data?.data ?? null;
+  const planId = credits?.planId ?? subscription?.planId ?? null;
+  const monthlyRemaining = toFiniteNumber(credits?.monthlyCredits);
+  const purchasedRemaining = toFiniteNumber(credits?.purchasedCredits);
+  const freeRemaining = toFiniteNumber(credits?.freeCredits);
+  const planMonthlyCredits = getPlanMonthlyCredits(planId);
+  const windowLimits = credits?.windowLimits ?? null;
+  const fetchedAt = new Date().toISOString();
+
+  const usage = {
+    id: account.id,
+    status: creditsResponse.ok && subscriptionResponse.ok ? 'ok' : 'unavailable',
+    fetchedAt,
+    fiveHour: normalizeUsageWindow(windowLimits?.fiveHour),
+    weekly: normalizeUsageWindow(windowLimits?.weekly),
+    monthly: {
+      used: planMonthlyCredits !== null && monthlyRemaining !== null ? Math.max(0, planMonthlyCredits - monthlyRemaining) : null,
+      cap: planMonthlyCredits,
+      remaining: monthlyRemaining === null ? null : Math.max(0, monthlyRemaining),
+      resetAt: toIsoDate(subscription?.currentPeriodEnd),
+      purchasedRemaining: purchasedRemaining === null ? null : Math.max(0, purchasedRemaining),
+      freeRemaining: freeRemaining === null ? null : Math.max(0, freeRemaining),
+    },
+    // 限额是否启用由官方直接返回；未启用时（例如按量付费）不可因空值误切换账号。
+    limited: windowLimits?.limited === true,
+    totalCost: toFiniteNumber(summaryResponse.data?.totalCost),
+  };
+
+  const previous = poolUsageStore.get(account.id);
+  poolUsageStore.set(account.id, {
+    ...previous,
+    usage,
+    fetchedAtMs: Date.now(),
+    blockedUntil: previous?.blockedUntil && previous.blockedUntil > Date.now() ? previous.blockedUntil : 0,
+  });
+  return usage;
+}
+
+async function refreshPoolUsage(force = false) {
+  if (!ACCOUNT_POOL.enabled) return [];
+  const now = Date.now();
+  const stale = ACCOUNT_POOL.accounts.some(account => {
+    const cached = poolUsageStore.get(account.id);
+    return !cached || now - (cached.fetchedAtMs || 0) >= ACCOUNT_POOL.usageRefreshIntervalMs;
+  });
+  if (!force && !stale) return ACCOUNT_POOL.accounts.map(account => poolUsageStore.get(account.id)?.usage).filter(Boolean);
+  if (poolUsageRefreshPromise) return poolUsageRefreshPromise;
+
+  poolUsageRefreshPromise = Promise.all(ACCOUNT_POOL.accounts.map(async account => {
+    try { return await refreshAccountUsage(account); }
+    catch { return poolUsageStore.get(account.id)?.usage ?? { id: account.id, status: 'unavailable' }; }
+  })).finally(() => { poolUsageRefreshPromise = null; });
+  return poolUsageRefreshPromise;
+}
+
+function windowIsExhausted(window) {
+  return window && window.used !== null && window.cap !== null && window.cap > 0 && window.used >= window.cap;
+}
+
+function getUsageBlockedUntil(usage) {
+  if (!usage || usage.status !== 'ok') return 0;
+  const exhaustedWindow = [usage.fiveHour, usage.weekly].find(windowIsExhausted);
+  if (usage.limited && exhaustedWindow?.resetAt) return new Date(exhaustedWindow.resetAt).getTime() || 0;
+  const monthly = usage.monthly;
+  if (monthly?.remaining === 0 && (monthly.purchasedRemaining || 0) === 0 && (monthly.freeRemaining || 0) === 0 && monthly.resetAt) {
+    return new Date(monthly.resetAt).getTime() || 0;
+  }
+  return 0;
+}
+
+function selectPoolAccount(excluded = new Set()) {
+  const now = Date.now();
+  const count = ACCOUNT_POOL.accounts.length;
+  for (let offset = 0; offset < count; offset++) {
+    const index = (poolCursor + offset) % count;
+    const account = ACCOUNT_POOL.accounts[index];
+    if (excluded.has(account.id)) continue;
+    const state = poolUsageStore.get(account.id);
+    const usageBlockedUntil = getUsageBlockedUntil(state?.usage);
+    const blockedUntil = Math.max(state?.blockedUntil || 0, usageBlockedUntil);
+    if (blockedUntil > now) continue;
+    poolCursor = (index + 1) % count;
+    return account;
+  }
+  return null;
+}
+
+function extractResetAt(value) {
+  if (!value || typeof value !== 'object') return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = extractResetAt(item);
+      if (found) return found;
+    }
+    return null;
+  }
+  for (const [key, candidate] of Object.entries(value)) {
+    if (/reset(?:s|_at|At)?$/i.test(key)) {
+      const normalized = toIsoDate(candidate);
+      if (normalized) return normalized;
+    }
+    const nested = extractResetAt(candidate);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function isQuotaExhaustedResponse(status, body) {
+  if (status === 402) return true;
+  if (status !== 429) return false;
+  let parsed = null;
+  try { parsed = JSON.parse(body); } catch {}
+  if (parsed?.error?.rateLimit || parsed?.rateLimit) return true;
+  const message = typeof body === 'string' ? body : '';
+  return /(?:5[- ]?hour|weekly|monthly)\s+(?:usage\s+)?(?:limit|quota)|usage\s+limit|insufficient\s+credits|credit\s+(?:balance|limit)/i.test(message);
+}
+
+function markPoolAccountBlocked(account, responseBody) {
+  let resetAt = null;
+  try { resetAt = extractResetAt(JSON.parse(responseBody)); } catch {}
+  const resetMs = resetAt ? new Date(resetAt).getTime() : 0;
+  // 未提供 reset 时间时只短暂避开该账号；下一次正式额度刷新会重新判定。
+  const blockedUntil = resetMs > Date.now() ? resetMs : Date.now() + 5 * 60 * 1000;
+  const previous = poolUsageStore.get(account.id);
+  poolUsageStore.set(account.id, { ...previous, blockedUntil });
+  log('warn', 'Pool account temporarily unavailable', { accountId: account.id, resetAt: resetAt || null });
+}
+
+async function forwardWithPoolFailover(body, initialApiKey, incomingHeaders, signal) {
+  const usingPool = isPoolProxyKey(getRequestCredential(incomingHeaders));
+  if (!usingPool) {
+    await ensureInitialized(initialApiKey, signal);
+    return { response: await forwardToCC(body, initialApiKey, incomingHeaders, signal), apiKey: initialApiKey, errorText: null };
+  }
+
+  const attempted = new Set();
+  let account = ACCOUNT_POOL.accounts.find(item => item.apiKey === initialApiKey) || selectPoolAccount(attempted);
+  let lastResponse = null;
+  let lastErrorText = '';
+  while (account && !attempted.has(account.id)) {
+    attempted.add(account.id);
+    await ensureInitialized(account.apiKey, signal);
+    const response = await forwardToCC(body, account.apiKey, incomingHeaders, signal);
+    if (response.ok) return { response, apiKey: account.apiKey, errorText: null };
+
+    const errorText = await response.text().catch(() => '');
+    lastResponse = response;
+    lastErrorText = errorText;
+    if (!isQuotaExhaustedResponse(response.status, errorText)) {
+      return { response, apiKey: account.apiKey, errorText };
+    }
+
+    markPoolAccountBlocked(account, errorText);
+    account = selectPoolAccount(attempted);
+  }
+  return { response: lastResponse, apiKey: initialApiKey, errorText: lastErrorText };
 }
 
 // ── 模型列表 ───────────────────────────────────────
@@ -734,20 +1041,27 @@ function sendJSON(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function getApiKey(headers) {
-  // Try Authorization: Bearer header (OpenAI SDK style)
+function getRequestCredential(headers) {
+  // 保留原有 Bearer / x-api-key 取值方式；账号池 key 仅在完整相等时才会命中。
   const auth = headers['authorization'] || headers['Authorization'] || '';
-  if (auth.startsWith('Bearer ')) {
-    const match = auth.slice(7).match(/user_[a-zA-Z0-9_-]+/);
-    if (match) return match[0];
+  if (typeof auth === 'string') {
+    const match = auth.match(/^Bearer\s+(.+)$/i);
+    if (match) return match[1].trim();
   }
-  // Fall back to x-api-key header (Anthropic SDK style)
   const xKey = headers['x-api-key'] || headers['X-Api-Key'] || '';
-  if (xKey) {
-    const match = xKey.match(/user_[a-zA-Z0-9_-]+/);
-    if (match) return match[0];
+  return typeof xKey === 'string' ? xKey.trim() : null;
+}
+
+async function getApiKey(headers) {
+  const credential = getRequestCredential(headers);
+  if (isPoolProxyKey(credential)) {
+    await refreshPoolUsage();
+    // 所有账号已被本地标记为耗尽时，仍交给上游返回规范的 429，而非误报为缺少 Key。
+    return selectPoolAccount()?.apiKey || ACCOUNT_POOL.accounts[0]?.apiKey || null;
   }
-  return null;
+  // 与原实现兼容：客户端可携带含 user_ key 的既有 Bearer 包装格式。
+  const match = credential?.match(/user_[a-zA-Z0-9_-]+/);
+  return match && COMMAND_CODE_KEY_RE.test(match[0]) ? match[0] : null;
 }
 
 // ── 流式转发 ────────────────────────────────────────
@@ -788,7 +1102,7 @@ async function handleChatCompletions(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
+  const apiKey = await getApiKey(req.headers);
   if (!apiKey) {
     sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
     return;
@@ -812,13 +1126,12 @@ async function handleChatCompletions(req, res) {
   let translator = null;
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    // 转发到 CC API（传入客户端 headers，用于提取 session ID）
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    // 账号池只在上游明确返回额度耗尽且尚未输出内容时切换；既有请求转换和流处理保持不变。
+    const upstream = await forwardWithPoolFailover(ccBody, apiKey, req.headers, abortController.signal);
+    const ccResponse = upstream.response;
 
     if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
+      const errorText = upstream.errorText ?? await ccResponse.text().catch(() => '');
       log('error', 'CC API error', { status: ccResponse.status });
       const mapped = mapCcError(ccResponse.status, errorText);
       sendJSON(res, mapped.status, mapped.body);
@@ -1541,7 +1854,7 @@ async function handleMessages(req, res) {
     return;
   }
 
-  const apiKey = getApiKey(req.headers);
+  const apiKey = await getApiKey(req.headers);
   if (!apiKey) {
     sendJSON(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header' } });
     return;
@@ -1563,12 +1876,11 @@ async function handleMessages(req, res) {
   let bytesReceived = 0; let lastCcEvent = ''; let fullText = '';
 
   try {
-    // 首次初始化（fingerprint + lifecycle）
-    await ensureInitialized(apiKey, abortController.signal);
-    const ccResponse = await forwardToCC(ccBody, apiKey, req.headers, abortController.signal);
+    const upstream = await forwardWithPoolFailover(ccBody, apiKey, req.headers, abortController.signal);
+    const ccResponse = upstream.response;
 
     if (!ccResponse.ok) {
-      const errorText = await ccResponse.text().catch(() => '');
+      const errorText = upstream.errorText ?? await ccResponse.text().catch(() => '');
       log('error', 'CC API error (Anthropic)', { status: ccResponse.status });
       const mapped = mapCcError(ccResponse.status, errorText);
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
@@ -1864,7 +2176,7 @@ async function fetchModels(apiKey) {
 }
 
 async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers);
+  const apiKey = await getApiKey(req.headers);
   const models = await fetchModels(apiKey);
   const now = nowUnix();
   sendJSON(res, 200, {
@@ -1883,6 +2195,41 @@ function handleHealth(req, res) {
   res.end('OK');
 }
 
+function getRemoteAddress(req) {
+  const address = req.socket?.remoteAddress || '';
+  return address.startsWith('::ffff:') ? address.slice(7) : address;
+}
+
+function isUsageRequestAllowed(req) {
+  const configured = Array.isArray(CFG.usageAllowedIps) ? CFG.usageAllowedIps : ['127.0.0.1', '::1'];
+  // 不信任 X-Forwarded-For，避免客户端伪造来源地址绕过这个无鉴权接口的访问控制。
+  return configured.includes(getRemoteAddress(req));
+}
+
+async function handleUsage(req, res) {
+  if (!isUsageRequestAllowed(req)) {
+    sendJSON(res, 403, { error: { message: 'Usage endpoint is restricted to configured source IPs', type: 'access_denied' } });
+    return;
+  }
+  if (!ACCOUNT_POOL.enabled) {
+    sendJSON(res, 409, { error: { message: 'Account pool is not enabled', type: 'account_pool_not_configured' } });
+    return;
+  }
+
+  // /usage 必须反映当前值，因此强制刷新；并发请求会共用同一轮上游查询。
+  const usages = await refreshPoolUsage(true);
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  sendJSON(res, 200, {
+    object: 'account_pool_usage',
+    fetchedAt: new Date().toISOString(),
+    accounts: ACCOUNT_POOL.accounts.map(account => usages.find(usage => usage?.id === account.id) || {
+      id: account.id,
+      status: 'unavailable',
+    }),
+  });
+}
+
 // ── 服务器 ──────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
@@ -1898,6 +2245,11 @@ const server = http.createServer(async (req, res) => {
 
   const host = req.headers.host || 'localhost';
   const url = new URL(req.url, `http://${host}`);
+  if (url.pathname === '/usage') {
+    // 额度数据不应提供给跨站脚本读取；该端点仍然无需 API Key。
+    res.removeHeader('Access-Control-Allow-Origin');
+    res.removeHeader('Access-Control-Allow-Headers');
+  }
 
   try {
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
@@ -1906,6 +2258,8 @@ const server = http.createServer(async (req, res) => {
       await handleMessages(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {
       await handleModels(req, res);
+    } else if (url.pathname === '/usage' && req.method === 'GET') {
+      await handleUsage(req, res);
     } else if (url.pathname === '/health' || url.pathname === '/') {
       handleHealth(req, res);
     } else {

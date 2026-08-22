@@ -60,6 +60,32 @@ commandcode/
 | `logLevel` | `info` | 日志级别 |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
+| `usageAllowedIps` | `['127.0.0.1', '::1']` | 无鉴权 `/usage` 的允许来源 IP；不信任 `X-Forwarded-For` |
+| `accountPool` | 见下文 | 多账号池；默认关闭，开启后用一个专属代理 Key 调用所有已启用账号 |
+
+### 多账号池
+
+在 `config.json` 中填写账号池并将 `enabled` 设为 `true`：
+
+```json
+"accountPool": {
+  "enabled": true,
+  "proxyKey": "请替换为至少 24 位的随机专属代理 Key",
+  "usageRefreshIntervalMs": 60000,
+  "accounts": [
+    { "id": "account-1", "apiKey": "user_第一个CommandCodeKey", "enabled": true },
+    { "id": "account-2", "apiKey": "user_第二个CommandCodeKey", "enabled": true }
+  ]
+}
+```
+
+`config.json` 中的真实 Key 属于机密：不要提交包含真实值的文件，也不要通过聊天、日志或截图分享它。仓库中的值仅为占位示例。
+
+之后客户端统一传入 `proxyKey`（`Authorization: Bearer <proxyKey>` 或 `x-api-key`）。代理会先按轮询选择未耗尽的账号；当上游在**尚未输出内容前**明确返回 5 小时、每周、每月额度耗尽或余额不足时，立即切换下一个可用账号并重试。已经开始输出的流不会重放，以免产生重复内容。
+
+额度缓存默认每 60 秒刷新一次；每次访问 `/usage` 会强制刷新。账号 ID 只能使用字母、数字、点、下划线、连字符，且不得重复。真实 `user_` Key、用户资料和官方原始响应都不会出现在日志或 `/usage` 响应中。
+
+`/usage` 不需要任何 API Key，但默认只允许本机来源。若监控程序不在本机，请将其固定 IP 明确加入 `usageAllowedIps`，例如 `["127.0.0.1", "10.0.0.20"]`；不要使用 `0.0.0.0`、网段通配或反向代理提供的 `X-Forwarded-For` 作为信任依据。
 
 ### 环境变量
 
@@ -242,12 +268,22 @@ data: {"type":"message_stop"}
 
 健康检查。返回 `OK`。
 
+### `GET /usage`
+
+只读、无需鉴权的账号池额度接口。返回每个配置账号的 `fiveHour`、`weekly`、`monthly` 当前已用额度、上限、剩余额度和重置时间；不会返回任何 API Key、邮箱、用户名或上游原始数据。
+
+```bash
+curl http://127.0.0.1:3050/usage
+```
+
 ## 错误码
 
 | HTTP 状态 | 说明 |
 |-----------|------|
 | 400 | 请求格式错误 |
-| 401 | API Key 缺失/格式不对/无效（Key 必须以 `user_` 开头；通过 `Authorization: Bearer` 或 `x-api-key` 传入） |
+| 401 | API Key 缺失/格式不对/无效（普通调用 Key 必须以 `user_` 开头；账号池调用使用配置的专属 `proxyKey`） |
+| 403 | `/usage` 请求来源不在 `usageAllowedIps` 白名单内 |
+| 409 | 请求 `/usage` 但账号池尚未启用 |
 | 429 | 零输出 token，或流空闲超时（30s 流式 / 90s 非流式）——带 `Retry-After`，SDK 自动重试；连续 3 次超时返回"压缩上下文"提示 |
 | 502 | CC 上游错误 |
 
