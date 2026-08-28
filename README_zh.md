@@ -72,6 +72,7 @@ commandcode/
   "enabled": true,
   "proxyKey": "请替换为至少 24 位的随机专属代理 Key",
   "usageRefreshIntervalMs": 60000,
+  "selectionStrategy": "earliest_monthly_reset",
   "accounts": [
     { "id": "account-1", "apiKey": "user_第一个CommandCodeKey", "enabled": true },
     { "id": "account-2", "apiKey": "user_第二个CommandCodeKey", "enabled": true }
@@ -81,7 +82,9 @@ commandcode/
 
 `config.json` 中的真实 Key 属于机密：不要提交包含真实值的文件，也不要通过聊天、日志或截图分享它。仓库中的值仅为占位示例。
 
-之后客户端统一传入 `proxyKey`（`Authorization: Bearer <proxyKey>` 或 `x-api-key`）。代理会先按轮询选择未耗尽的账号；当上游在**尚未输出内容前**明确返回 5 小时、每周、每月额度耗尽或余额不足时，立即切换下一个可用账号并重试。已经开始输出的流不会重放，以免产生重复内容。
+之后客户端统一传入 `proxyKey`（`Authorization: Bearer <proxyKey>` 或 `x-api-key`）。默认 `selectionStrategy` 为 `earliest_monthly_reset`：在未耗尽的账号中，优先使用月度额度重置时间更早的账号；同一重置时间再按轮询打破平局。可设为 `round_robin` 恢复纯轮询。5-hour 或 Weekly 窗口已耗尽的账号会在其重置前跳过。
+
+当上游在**尚未输出内容前**明确返回 402，或可识别的 429 额度耗尽／余额不足时，代理立即切换下一个可用账号并重试；普通 4xx/5xx、鉴权失败、模型不可用和已开始输出的流都不会切换或重放，以免掩盖错误或产生重复内容。
 
 额度缓存默认每 60 秒刷新一次；每次访问 `/usage` 会强制刷新。账号 ID 只能使用字母、数字、点、下划线、连字符，且不得重复。真实 `user_` Key、用户资料和官方原始响应都不会出现在日志或 `/usage` 响应中。
 

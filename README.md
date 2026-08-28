@@ -436,6 +436,8 @@ docker compose restart proxy
 
 If the configuration file is missing, invalid JSON, `accountPool.enabled` is not a boolean, or an enabled pool has duplicate IDs/invalid keys, startup logs a clear `[config]` error and exits instead of silently disabling the pool. `usageAllowedIps` accepts `"*"` (allow all) or literal IP addresses such as `"172.17.0.1"`; do not write it as `"\*"`, and do not put Markdown links in `apiBase`.
 
+For an enabled account pool, `selectionStrategy` defaults to `earliest_monthly_reset`: eligible accounts whose monthly allowance renews sooner are selected first, with round-robin tie breaking. Set it to `round_robin` to retain pure rotation. Accounts with an exhausted reported 5-hour or weekly window are skipped until their reset time.
+
 The proxy will listen on `http://0.0.0.0:3050`. Set `PROXY_PORT` to customize the host port:
 
 ```bash

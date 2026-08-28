@@ -28,6 +28,7 @@ function loadConfig() {
       enabled: false,
       proxyKey: '',
       usageRefreshIntervalMs: 60 * 1000,
+      selectionStrategy: 'earliest_monthly_reset',
       accounts: [],
     },
   };
@@ -76,13 +77,14 @@ const ACCOUNT_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const COMMAND_CODE_KEY_RE = /^user_[A-Za-z0-9_-]+$/;
 const MIN_POOL_PROXY_KEY_LENGTH = 24;
 const MAX_POOL_ACCOUNTS = 50;
+const POOL_SELECTION_STRATEGIES = new Set(['earliest_monthly_reset', 'round_robin']);
 
 function normalizeAccountPool(rawPool) {
-  if (rawPool === undefined || rawPool === null) return { enabled: false, accounts: [], proxyKey: '', usageRefreshIntervalMs: 60 * 1000 };
+  if (rawPool === undefined || rawPool === null) return { enabled: false, accounts: [], proxyKey: '', usageRefreshIntervalMs: 60 * 1000, selectionStrategy: 'earliest_monthly_reset' };
   if (typeof rawPool !== 'object' || Array.isArray(rawPool)) throw new Error('accountPool must be an object');
   const raw = rawPool;
   if (typeof raw.enabled !== 'boolean') throw new Error('accountPool.enabled must be a boolean');
-  if (raw.enabled !== true) return { enabled: false, accounts: [], proxyKey: '', usageRefreshIntervalMs: 60 * 1000 };
+  if (raw.enabled !== true) return { enabled: false, accounts: [], proxyKey: '', usageRefreshIntervalMs: 60 * 1000, selectionStrategy: 'earliest_monthly_reset' };
 
   if (typeof raw.proxyKey !== 'string' || raw.proxyKey.length < MIN_POOL_PROXY_KEY_LENGTH) {
     throw new Error(`accountPool.proxyKey must be a random secret of at least ${MIN_POOL_PROXY_KEY_LENGTH} characters`);
@@ -106,11 +108,16 @@ function normalizeAccountPool(rawPool) {
 
   if (accounts.length === 0) throw new Error('accountPool must have at least one enabled account');
   const interval = Number(raw.usageRefreshIntervalMs);
+  const selectionStrategy = raw.selectionStrategy ?? 'earliest_monthly_reset';
+  if (typeof selectionStrategy !== 'string' || !POOL_SELECTION_STRATEGIES.has(selectionStrategy)) {
+    throw new Error('accountPool.selectionStrategy must be "earliest_monthly_reset" or "round_robin"');
+  }
   return {
     enabled: true,
     proxyKey: raw.proxyKey,
     accounts,
     usageRefreshIntervalMs: Number.isFinite(interval) ? Math.min(Math.max(interval, 15 * 1000), 15 * 60 * 1000) : 60 * 1000,
+    selectionStrategy,
   };
 }
 
@@ -394,16 +401,26 @@ function toIsoDate(value) {
 
 function normalizeUsageWindow(window) {
   if (!window || typeof window !== 'object') return null;
-  const used = toFiniteNumber(window.used);
-  const cap = toFiniteNumber(window.cap);
+  // Command Code has returned both the documented used/cap names and equivalent
+  // field names in different billing responses. Normalize only numeric values.
+  const used = toFiniteNumber(window.used ?? window.usage ?? window.consumed);
+  const cap = toFiniteNumber(window.cap ?? window.limit ?? window.maximum);
+  const reportedRemaining = toFiniteNumber(window.remaining);
   const resetAt = toIsoDate(window.resetAt ?? window.reset_at ?? window.resetsAt ?? window.resets_at);
-  if (used === null && cap === null && !resetAt) return null;
+  if (used === null && cap === null && reportedRemaining === null && !resetAt) return null;
   return {
     used: used === null ? null : Math.max(0, used),
     cap: cap === null ? null : Math.max(0, cap),
-    remaining: used !== null && cap !== null ? Math.max(0, cap - used) : null,
+    remaining: used !== null && cap !== null ? Math.max(0, cap - used) : (reportedRemaining === null ? null : Math.max(0, reportedRemaining)),
     resetAt,
   };
+}
+
+function pickUsageWindowLimits(...candidates) {
+  for (const candidate of candidates) {
+    if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) return candidate;
+  }
+  return null;
 }
 
 const PLAN_MONTHLY_CREDITS = {
@@ -468,15 +485,26 @@ async function refreshAccountUsage(account) {
   const purchasedRemaining = toFiniteNumber(credits?.purchasedCredits);
   const freeRemaining = toFiniteNumber(credits?.freeCredits);
   const planMonthlyCredits = getPlanMonthlyCredits(planId);
-  const windowLimits = credits?.windowLimits ?? null;
+  // The CLI billing API has used both { credits: { windowLimits } } and
+  // { credits, windowLimits } response shapes. Read either without exposing
+  // the provider's raw response from /usage.
+  const windowLimits = pickUsageWindowLimits(
+    creditsResponse.data?.windowLimits,
+    credits?.windowLimits,
+    subscriptionResponse.data?.windowLimits,
+    subscription?.windowLimits,
+    summaryResponse.data?.windowLimits,
+  );
+  const fiveHour = normalizeUsageWindow(windowLimits?.fiveHour ?? windowLimits?.five_hour);
+  const weekly = normalizeUsageWindow(windowLimits?.weekly);
   const fetchedAt = new Date().toISOString();
 
   const usage = {
     id: account.id,
     status: creditsResponse.ok && subscriptionResponse.ok ? 'ok' : 'unavailable',
     fetchedAt,
-    fiveHour: normalizeUsageWindow(windowLimits?.fiveHour),
-    weekly: normalizeUsageWindow(windowLimits?.weekly),
+    fiveHour,
+    weekly,
     monthly: {
       used: planMonthlyCredits !== null && monthlyRemaining !== null ? Math.max(0, planMonthlyCredits - monthlyRemaining) : null,
       cap: planMonthlyCredits,
@@ -485,8 +513,9 @@ async function refreshAccountUsage(account) {
       purchasedRemaining: purchasedRemaining === null ? null : Math.max(0, purchasedRemaining),
       freeRemaining: freeRemaining === null ? null : Math.max(0, freeRemaining),
     },
-    // 限额是否启用由官方直接返回；未启用时（例如按量付费）不可因空值误切换账号。
-    limited: windowLimits?.limited === true,
+    // If the official response gives a concrete rolling window but omits the
+    // optional `limited` flag, it is still safe to avoid an exhausted window.
+    limited: windowLimits?.limited === true || (windowLimits?.limited !== false && Boolean(fiveHour || weekly)),
     totalCost: toFiniteNumber(summaryResponse.data?.totalCost),
   };
 
@@ -532,9 +561,15 @@ function getUsageBlockedUntil(usage) {
   return 0;
 }
 
+function getMonthlyResetPriority(usage, now) {
+  const resetMs = usage?.monthly?.resetAt ? new Date(usage.monthly.resetAt).getTime() : 0;
+  return Number.isFinite(resetMs) && resetMs > now ? resetMs : Number.POSITIVE_INFINITY;
+}
+
 function selectPoolAccount(excluded = new Set()) {
   const now = Date.now();
   const count = ACCOUNT_POOL.accounts.length;
+  const candidates = [];
   for (let offset = 0; offset < count; offset++) {
     const index = (poolCursor + offset) % count;
     const account = ACCOUNT_POOL.accounts[index];
@@ -543,10 +578,24 @@ function selectPoolAccount(excluded = new Set()) {
     const usageBlockedUntil = getUsageBlockedUntil(state?.usage);
     const blockedUntil = Math.max(state?.blockedUntil || 0, usageBlockedUntil);
     if (blockedUntil > now) continue;
-    poolCursor = (index + 1) % count;
-    return account;
+    candidates.push({ account, index, offset, usage: state?.usage });
   }
-  return null;
+  if (candidates.length === 0) return null;
+
+  let selected;
+  if (ACCOUNT_POOL.selectionStrategy === 'round_robin') {
+    selected = candidates[0];
+  } else {
+    // Prefer the account whose monthly cycle renews first. This consumes
+    // credits that would refresh soon, while exhausted rolling windows remain
+    // excluded above. Round-robin offset remains the deterministic tie-breaker.
+    selected = candidates.sort((left, right) => {
+      const resetDifference = getMonthlyResetPriority(left.usage, now) - getMonthlyResetPriority(right.usage, now);
+      return resetDifference || left.offset - right.offset;
+    })[0];
+  }
+  poolCursor = (selected.index + 1) % count;
+  return selected.account;
 }
 
 function extractResetAt(value) {
@@ -628,6 +677,7 @@ const MODELS = [
   { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
   { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
   // OpenAI
+  { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna' },
   { id: 'gpt-5.5', name: 'GPT-5.5' },
   { id: 'gpt-5.4', name: 'GPT-5.4' },
   { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
