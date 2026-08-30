@@ -61,6 +61,7 @@ commandcode/
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 | `usageAllowedIps` | `['*']` | 无鉴权 `/usage` 的允许来源 IP；`'*'` 表示允许所有容器/宿主机来源 |
+| `adminAuth` | 见下文 | 在线账号设置的登录与来源限制；默认关闭 |
 | `accountPool` | 见下文 | 多账号池；默认关闭，开启后用一个专属代理 Key 调用所有已启用账号 |
 
 ### 多账号池
@@ -72,23 +73,43 @@ commandcode/
   "enabled": true,
   "proxyKey": "请替换为至少 24 位的随机专属代理 Key",
   "usageRefreshIntervalMs": 60000,
-  "selectionStrategy": "earliest_monthly_reset",
+  "selectionStrategy": "priority",
   "accounts": [
-    { "id": "account-1", "apiKey": "user_第一个CommandCodeKey", "enabled": true },
-    { "id": "account-2", "apiKey": "user_第二个CommandCodeKey", "enabled": true }
+    { "id": "account-1", "alias": "主账号", "priority": 1, "apiKey": "user_第一个CommandCodeKey", "enabled": true },
+    { "id": "account-2", "alias": "备用账号", "priority": 2, "apiKey": "user_第二个CommandCodeKey", "enabled": true }
   ]
 }
 ```
 
 `config.json` 中的真实 Key 属于机密：不要提交包含真实值的文件，也不要通过聊天、日志或截图分享它。仓库中的值仅为占位示例。
 
-之后客户端统一传入 `proxyKey`（`Authorization: Bearer <proxyKey>` 或 `x-api-key`）。默认 `selectionStrategy` 为 `earliest_monthly_reset`：在未耗尽的账号中，优先使用月度额度重置时间更早的账号；同一重置时间再按轮询打破平局。可设为 `round_robin` 恢复纯轮询。5-hour 或 Weekly 窗口已耗尽的账号会在其重置前跳过。
+之后客户端统一传入 `proxyKey`（`Authorization: Bearer <proxyKey>` 或 `x-api-key`）。默认 `selectionStrategy` 为 `priority`：数字越小优先级越高，因此会稳定按优先级 1 → 2 → 3 调用；仅当较高优先级账号被本地已知额度状态或上游额度错误标记为不可用时，才使用下一个账号。`earliest_monthly_reset` 可按月度重置时间优先，`round_robin` 为纯轮询。5-hour 或 Weekly 窗口已耗尽的账号会在其重置前跳过。
 
 当上游在**尚未输出内容前**明确返回 402，或可识别的 429 额度耗尽／余额不足时，代理立即切换下一个可用账号并重试；普通 4xx/5xx、鉴权失败、模型不可用和已开始输出的流都不会切换或重放，以免掩盖错误或产生重复内容。
 
 额度缓存默认每 60 秒刷新一次；每次访问 `/usage` 会强制刷新。账号 ID 只能使用字母、数字、点、下划线、连字符，且不得重复。真实 `user_` Key、用户资料和官方原始响应都不会出现在日志或 `/usage` 响应中。
 
 `/usage` 不需要任何 API Key，默认通过 `usageAllowedIps: ["*"]` 允许所有容器/宿主机来源。需要收紧访问范围时，将其改为固定 IP 列表，例如 `["127.0.0.1", "172.17.0.1", "10.0.0.20"]`；精确 IP 模式不信任反向代理提供的 `X-Forwarded-For`。
+
+### 在线账号设置与登录
+
+在线设置默认关闭。要启用它，先为管理密码生成 scrypt 哈希（不要把明文密码提交到仓库），再填写 `adminAuth`：
+
+```json
+"adminAuth": {
+  "enabled": true,
+  "passwordHash": "scrypt$16384$8$1$<salt-base64url>$<hash-base64url>",
+  "allowedIps": ["你的管理端出口 IP"],
+  "sessionTtlMinutes": 120,
+  "secureCookie": true
+}
+```
+
+可在可信机器上用 Node 的 `crypto.scryptSync` 生成上述格式（固定参数为 `N=16384, r=8, p=1`，随机 salt 至少 16 字节，输出 64 字节 hash）。启用后从 HTTPS 地址访问 `/admin`；页面可修改别名、优先级、启用状态、替换账号 Key、替换专属代理 Key，并立即重载。页面和 API 从不返回真实 Key；留空 Key 输入框会保留原值。
+
+`secureCookie` 默认为 `true`，管理页面必须经 HTTPS 反向代理访问。仅本机调试时可设为 `false`，此时 `allowedIps` 只能是 `127.0.0.1` 和/或 `::1`。管理员登录有 5 次失败、15 分钟封锁的限速；配置写入请求还需要同源 HttpOnly 会话和 CSRF token。
+
+在线保存不会修改只读的宿主机 `config.json`。Compose 会将配置持久化到 `runtime-data` Docker 卷中的受限覆盖文件；该覆盖文件会优先于 `config.json` 的 `accountPool`。如需改回宿主机配置，先在设置页保存目标值，或在维护窗口删除该 Docker 卷后重启服务。
 
 ### 环境变量
 
@@ -273,13 +294,15 @@ data: {"type":"message_stop"}
 
 ### `GET /usage`
 
-只读、无需鉴权的账号池额度接口。在浏览器直接打开时会显示深色的可视化额度面板，每个账号仅展示官方实际返回的 5-Hour、Weekly、Monthly 额度；没有 Token 或窗口数据时不会伪造图表。不会返回任何 API Key、邮箱、用户名或上游原始数据。
+只读、无需鉴权的账号池额度接口。在浏览器直接打开时会显示深色的可视化额度面板，每个账号仅展示官方实际返回的 5-Hour、Weekly、Monthly 额度；若官方汇总接口返回请求数和 Token 总量，会额外显示“历史汇总”。没有 Token 或窗口数据时不会伪造图表。不会返回任何 API Key、邮箱、用户名或上游原始数据。
 
 ```bash
 # 浏览器：打开 http://127.0.0.1:3050/usage （或 ?format=html）
 # JSON（供脚本/监控使用）：
 curl 'http://127.0.0.1:3050/usage?format=json'
 ```
+
+启用 `adminAuth` 后，额度卡片右上角会出现“设置”。“已同步”状态移到账号名称下方，并显示当前优先级。
 
 ## 错误码
 
@@ -469,7 +492,7 @@ docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/comman
 docker compose up -d
 ```
 
-Compose 会将当前目录的 `config.json` 以只读方式挂载到容器内 `/app/config.json`。代理实际按 `proxy.mjs` 所在目录读取该路径，不依赖容器的当前工作目录。修改账号池、Key 或额度相关配置后无需重新构建镜像，直接重启即可生效：
+Compose 会将当前目录的 `config.json` 以只读方式挂载到容器内 `/app/config.json`，并创建持久的 `runtime-data` 卷供已登录的在线设置使用。代理实际按 `proxy.mjs` 所在目录读取该路径，不依赖容器的当前工作目录。修改宿主机账号池、Key 或额度相关配置后无需重新构建镜像，直接重启即可生效：
 
 ```bash
 docker compose restart proxy
@@ -489,6 +512,7 @@ PROXY_PORT=13050 docker compose up -d
 docker build -t commandcode-proxy:latest .
 docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 \
   --mount type=bind,src="$(pwd)/config.json",dst=/app/config.json,readonly \
+  --mount type=volume,src=cc-proxy-runtime-data,dst=/app/data \
   commandcode-proxy:latest
 ```
 

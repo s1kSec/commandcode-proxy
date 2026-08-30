@@ -5,13 +5,40 @@
 import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, unlinkSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { isIP } from 'net';
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const CONFIG_PATH = resolve(__dirname, 'config.json');
+const RUNTIME_DATA_DIR = resolve(__dirname, 'data');
+// This path is fixed in source code. It is never derived from a request, so the
+// online settings endpoint cannot be used for path traversal or arbitrary writes.
+const ACCOUNT_POOL_OVERRIDE_PATH = resolve(RUNTIME_DATA_DIR, 'account-pool.override.json');
+
+function readJsonConfigFile(path, label) {
+  try {
+    const value = JSON.parse(readFileSync(path, 'utf-8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('top-level JSON value must be an object');
+    }
+    return value;
+  } catch (e) {
+    throw new Error(`[config] Failed to load ${label}: ${e.message}`);
+  }
+}
+
+function loadAccountPoolOverride() {
+  if (!existsSync(ACCOUNT_POOL_OVERRIDE_PATH)) return null;
+  const override = readJsonConfigFile(ACCOUNT_POOL_OVERRIDE_PATH, 'runtime account-pool override');
+  const allowed = new Set(['version', 'accountPool']);
+  if (Object.keys(override).some(key => !allowed.has(key)) || override.version !== 1 || !override.accountPool || typeof override.accountPool !== 'object' || Array.isArray(override.accountPool)) {
+    throw new Error('[config] Runtime account-pool override has an invalid schema');
+  }
+  return override.accountPool;
+}
 
 function loadConfig() {
   const defaults = {
@@ -24,28 +51,30 @@ function loadConfig() {
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     usageAllowedIps: ['*'],
+    adminAuth: {
+      enabled: false,
+      passwordHash: '',
+      allowedIps: ['127.0.0.1', '::1'],
+      sessionTtlMinutes: 120,
+      secureCookie: true,
+    },
     accountPool: {
       enabled: false,
       proxyKey: '',
       usageRefreshIntervalMs: 60 * 1000,
-      selectionStrategy: 'earliest_monthly_reset',
+      selectionStrategy: 'priority',
       accounts: [],
     },
   };
 
-  const configPath = resolve(__dirname, 'config.json');
-  if (!existsSync(configPath)) {
-    throw new Error(`[config] Required config.json was not found at ${configPath}. Mount it at this exact path before starting the proxy.`);
+  if (!existsSync(CONFIG_PATH)) {
+    throw new Error(`[config] Required config.json was not found at ${CONFIG_PATH}. Mount it at this exact path before starting the proxy.`);
   }
-  try {
-    const user = JSON.parse(readFileSync(configPath, 'utf-8'));
-    if (!user || typeof user !== 'object' || Array.isArray(user)) {
-      throw new Error('top-level JSON value must be an object');
-    }
-    Object.assign(defaults, user);
-  } catch (e) {
-    throw new Error(`[config] Failed to load ${configPath}: ${e.message}`);
-  }
+  Object.assign(defaults, readJsonConfigFile(CONFIG_PATH, CONFIG_PATH));
+  // The base config remains read-only in Docker. Online account changes are
+  // persisted only to a dedicated Docker volume and override only this section.
+  const accountPoolOverride = loadAccountPoolOverride();
+  if (accountPoolOverride) defaults.accountPool = accountPoolOverride;
 
   // 环境变量覆写
   if (process.env.PORT) defaults.port = parseInt(process.env.PORT);
@@ -77,14 +106,83 @@ const ACCOUNT_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const COMMAND_CODE_KEY_RE = /^user_[A-Za-z0-9_-]+$/;
 const MIN_POOL_PROXY_KEY_LENGTH = 24;
 const MAX_POOL_ACCOUNTS = 50;
-const POOL_SELECTION_STRATEGIES = new Set(['earliest_monthly_reset', 'round_robin']);
+const MAX_ACCOUNT_ALIAS_LENGTH = 64;
+const POOL_SELECTION_STRATEGIES = new Set(['priority', 'earliest_monthly_reset', 'round_robin']);
+const SCRYPT_HASH_RE = /^scrypt\$(\d+)\$(\d+)\$(\d+)\$([A-Za-z0-9_-]+)\$([A-Za-z0-9_-]+)$/;
+
+function parseScryptHash(value) {
+  const match = typeof value === 'string' ? value.match(SCRYPT_HASH_RE) : null;
+  if (!match) return null;
+  const [, rawN, rawR, rawP, rawSalt, rawDigest] = match;
+  const N = Number(rawN);
+  const r = Number(rawR);
+  const p = Number(rawP);
+  if (N !== 16384 || r !== 8 || p !== 1) return null;
+  try {
+    const salt = Buffer.from(rawSalt, 'base64url');
+    const digest = Buffer.from(rawDigest, 'base64url');
+    if (salt.length < 16 || digest.length !== 64) return null;
+    return { N, r, p, salt, digest };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeAccountAlias(value, id) {
+  if (value === undefined || value === null || value === '') return id;
+  if (typeof value !== 'string') throw new Error('account alias must be a string');
+  const alias = value.trim();
+  if (!alias || alias.length > MAX_ACCOUNT_ALIAS_LENGTH || /[\u0000-\u001f\u007f]/.test(alias)) {
+    throw new Error(`account alias must contain 1-${MAX_ACCOUNT_ALIAS_LENGTH} printable characters`);
+  }
+  return alias;
+}
+
+function normalizeAccountPriority(value, index) {
+  const priority = value === undefined ? index + 1 : Number(value);
+  if (!Number.isInteger(priority) || priority < 1 || priority > 1000) {
+    throw new Error('account priority must be an integer from 1 to 1000');
+  }
+  return priority;
+}
+
+function normalizeAdminAuth(rawAuth) {
+  if (rawAuth === undefined || rawAuth === null) return { enabled: false };
+  if (typeof rawAuth !== 'object' || Array.isArray(rawAuth)) throw new Error('adminAuth must be an object');
+  if (typeof rawAuth.enabled !== 'boolean') throw new Error('adminAuth.enabled must be a boolean');
+  if (!rawAuth.enabled) return { enabled: false };
+  if (!parseScryptHash(rawAuth.passwordHash)) {
+    throw new Error('adminAuth.passwordHash must be a valid scrypt password hash');
+  }
+  if (!Array.isArray(rawAuth.allowedIps) || rawAuth.allowedIps.length === 0 || rawAuth.allowedIps.some(ip => typeof ip !== 'string' || (ip !== '*' && isIP(ip) === 0))) {
+    throw new Error('adminAuth.allowedIps must contain "*" and/or literal IPv4/IPv6 addresses');
+  }
+  const sessionTtlMinutes = Number(rawAuth.sessionTtlMinutes ?? 120);
+  if (!Number.isInteger(sessionTtlMinutes) || sessionTtlMinutes < 5 || sessionTtlMinutes > 720) {
+    throw new Error('adminAuth.sessionTtlMinutes must be an integer from 5 to 720');
+  }
+  if (rawAuth.secureCookie !== undefined && typeof rawAuth.secureCookie !== 'boolean') {
+    throw new Error('adminAuth.secureCookie must be a boolean');
+  }
+  // An HTTP session cookie is safe only on a loopback-only admin interface.
+  if (rawAuth.secureCookie === false && rawAuth.allowedIps.some(ip => ip !== '127.0.0.1' && ip !== '::1')) {
+    throw new Error('adminAuth.secureCookie may be false only when adminAuth.allowedIps is loopback-only');
+  }
+  return {
+    enabled: true,
+    passwordHash: rawAuth.passwordHash,
+    allowedIps: rawAuth.allowedIps,
+    sessionTtlMs: sessionTtlMinutes * 60 * 1000,
+    secureCookie: rawAuth.secureCookie !== false,
+  };
+}
 
 function normalizeAccountPool(rawPool) {
-  if (rawPool === undefined || rawPool === null) return { enabled: false, accounts: [], proxyKey: '', usageRefreshIntervalMs: 60 * 1000, selectionStrategy: 'earliest_monthly_reset' };
+  if (rawPool === undefined || rawPool === null) return { enabled: false, accounts: [], proxyKey: '', usageRefreshIntervalMs: 60 * 1000, selectionStrategy: 'priority' };
   if (typeof rawPool !== 'object' || Array.isArray(rawPool)) throw new Error('accountPool must be an object');
   const raw = rawPool;
   if (typeof raw.enabled !== 'boolean') throw new Error('accountPool.enabled must be a boolean');
-  if (raw.enabled !== true) return { enabled: false, accounts: [], proxyKey: '', usageRefreshIntervalMs: 60 * 1000, selectionStrategy: 'earliest_monthly_reset' };
+  if (raw.enabled !== true) return { enabled: false, accounts: [], proxyKey: '', usageRefreshIntervalMs: 60 * 1000, selectionStrategy: 'priority' };
 
   if (typeof raw.proxyKey !== 'string' || raw.proxyKey.length < MIN_POOL_PROXY_KEY_LENGTH) {
     throw new Error(`accountPool.proxyKey must be a random secret of at least ${MIN_POOL_PROXY_KEY_LENGTH} characters`);
@@ -94,7 +192,8 @@ function normalizeAccountPool(rawPool) {
   }
 
   const ids = new Set();
-  const accounts = raw.accounts.map((account, index) => {
+  const priorities = new Set();
+  const configuredAccounts = raw.accounts.map((account, index) => {
     if (!account || typeof account !== 'object' || !ACCOUNT_ID_RE.test(account.id || '')) {
       throw new Error(`accountPool.accounts[${index}].id must match ${ACCOUNT_ID_RE}`);
     }
@@ -103,32 +202,46 @@ function normalizeAccountPool(rawPool) {
     if (!COMMAND_CODE_KEY_RE.test(account.apiKey || '')) {
       throw new Error(`accountPool.accounts[${index}].apiKey must be a Command Code user_ key`);
     }
-    return { id: account.id, apiKey: account.apiKey, enabled: account.enabled !== false };
-  }).filter(account => account.enabled);
+    const priority = normalizeAccountPriority(account.priority, index);
+    if (priorities.has(priority)) throw new Error('accountPool account priorities must be unique');
+    priorities.add(priority);
+    return {
+      id: account.id,
+      alias: normalizeAccountAlias(account.alias, account.id),
+      apiKey: account.apiKey,
+      enabled: account.enabled !== false,
+      priority,
+    };
+  });
+  const accounts = configuredAccounts.filter(account => account.enabled);
 
   if (accounts.length === 0) throw new Error('accountPool must have at least one enabled account');
   const interval = Number(raw.usageRefreshIntervalMs);
-  const selectionStrategy = raw.selectionStrategy ?? 'earliest_monthly_reset';
+  const selectionStrategy = raw.selectionStrategy ?? 'priority';
   if (typeof selectionStrategy !== 'string' || !POOL_SELECTION_STRATEGIES.has(selectionStrategy)) {
-    throw new Error('accountPool.selectionStrategy must be "earliest_monthly_reset" or "round_robin"');
+    throw new Error('accountPool.selectionStrategy must be "priority", "earliest_monthly_reset", or "round_robin"');
   }
   return {
     enabled: true,
     proxyKey: raw.proxyKey,
     accounts,
+    configuredAccounts,
     usageRefreshIntervalMs: Number.isFinite(interval) ? Math.min(Math.max(interval, 15 * 1000), 15 * 60 * 1000) : 60 * 1000,
     selectionStrategy,
   };
 }
 
 let ACCOUNT_POOL;
+let ADMIN_AUTH;
 try {
   ACCOUNT_POOL = normalizeAccountPool(CFG.accountPool);
+  ADMIN_AUTH = normalizeAdminAuth(CFG.adminAuth);
   if (ACCOUNT_POOL.enabled) {
-    console.log(`[config] Account pool enabled with ${ACCOUNT_POOL.accounts.length} configured account(s)`);
+    console.log(`[config] Account pool enabled with ${ACCOUNT_POOL.accounts.length} configured account(s), strategy=${ACCOUNT_POOL.selectionStrategy}`);
   }
+  if (ADMIN_AUTH.enabled) console.log('[config] Admin settings login enabled');
 } catch (e) {
-  throw new Error(`[config] Invalid accountPool configuration: ${e.message}`);
+  throw new Error(`[config] Invalid accountPool/adminAuth configuration: ${e.message}`);
 }
 
 // ── 指纹生成（首次运行自动生成，写回 config.json） ──────
@@ -423,6 +536,26 @@ function pickUsageWindowLimits(...candidates) {
   return null;
 }
 
+function normalizeUsageSummary(summary) {
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) return null;
+  const normalized = {
+    totalRequests: toFiniteNumber(summary.totalCount),
+    completedRequests: toFiniteNumber(summary.completedCount),
+    failedRequests: toFiniteNumber(summary.failedCount),
+    successRate: toFiniteNumber(summary.successRate),
+    inputTokens: toFiniteNumber(summary.totalTokensIn),
+    outputTokens: toFiniteNumber(summary.totalTokensOut),
+    totalTokens: toFiniteNumber(summary.totalTokens),
+    totalCost: toFiniteNumber(summary.totalCost),
+    totalCredits: toFiniteNumber(summary.totalCredits),
+    monthlyCredits: toFiniteNumber(summary.totalMonthlyCredits),
+    purchasedCredits: toFiniteNumber(summary.totalPurchasedCredits),
+    freeCredits: toFiniteNumber(summary.totalFreeCredits),
+    periodBasis: typeof summary.periodBasis === 'string' && summary.periodBasis.length <= 64 ? summary.periodBasis : null,
+  };
+  return Object.values(normalized).some(value => value !== null) ? normalized : null;
+}
+
 const PLAN_MONTHLY_CREDITS = {
   'individual-go': 10,
   'individual-goat': 70,
@@ -497,6 +630,7 @@ async function refreshAccountUsage(account) {
   );
   const fiveHour = normalizeUsageWindow(windowLimits?.fiveHour ?? windowLimits?.five_hour);
   const weekly = normalizeUsageWindow(windowLimits?.weekly);
+  const summary = normalizeUsageSummary(summaryResponse.data);
   const fetchedAt = new Date().toISOString();
 
   const usage = {
@@ -516,7 +650,8 @@ async function refreshAccountUsage(account) {
     // If the official response gives a concrete rolling window but omits the
     // optional `limited` flag, it is still safe to avoid an exhausted window.
     limited: windowLimits?.limited === true || (windowLimits?.limited !== false && Boolean(fiveHour || weekly)),
-    totalCost: toFiniteNumber(summaryResponse.data?.totalCost),
+    totalCost: summary?.totalCost ?? null,
+    summary,
   };
 
   const previous = poolUsageStore.get(account.id);
@@ -585,6 +720,10 @@ function selectPoolAccount(excluded = new Set()) {
   let selected;
   if (ACCOUNT_POOL.selectionStrategy === 'round_robin') {
     selected = candidates[0];
+  } else if (ACCOUNT_POOL.selectionStrategy === 'priority') {
+    // Lower numbers are higher priority. An unavailable, exhausted, or
+    // temporarily blocked account has already been removed from candidates.
+    selected = candidates.sort((left, right) => left.account.priority - right.account.priority || left.offset - right.offset)[0];
   } else {
     // Prefer the account whose monthly cycle renews first. This consumes
     // credits that would refresh soon, while exhausted rolling windows remain
@@ -1089,15 +1228,15 @@ function mapCcError(ccStatus, ccBody) {
 
 // ── HTTP 请求处理 ──────────────────────────────────
 
-function readBody(req) {
+function readBody(req, maxBodySize = MAX_BODY_SIZE) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalSize = 0;
     req.on('data', c => {
       totalSize += c.length;
-      if (totalSize > MAX_BODY_SIZE) {
+      if (totalSize > maxBodySize) {
         req.destroy(new Error('Request body too large'));
-        reject(new Error('Request body exceeds 10MB limit'));
+        reject(new Error('Request body exceeds configured size limit'));
       }
       chunks.push(c);
     });
@@ -2312,7 +2451,26 @@ function renderUsageMeter(label, window) {
   </section>`;
 }
 
+function formatUsageNumber(value) {
+  if (!Number.isFinite(value)) return '—';
+  return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2, notation: Math.abs(value) >= 10000 ? 'compact' : 'standard' }).format(value);
+}
+
+function renderUsageSummary(summary) {
+  if (!summary || ![summary.totalRequests, summary.totalTokens, summary.inputTokens, summary.outputTokens].some(Number.isFinite)) return '';
+  const items = [
+    ['请求', summary.totalRequests],
+    ['总 Token', summary.totalTokens],
+    ['输入 Token', summary.inputTokens],
+    ['输出 Token', summary.outputTokens],
+    ['成功率', Number.isFinite(summary.successRate) ? `${(summary.successRate * (summary.successRate <= 1 ? 100 : 1)).toFixed(1)}%` : null],
+  ].filter(([, value]) => value !== null && value !== undefined).map(([label, value]) => `<span><b>${escapeHtml(label)}</b>${escapeHtml(typeof value === 'string' ? value : formatUsageNumber(value))}</span>`).join('');
+  const period = summary.periodBasis ? `<p>统计范围：${escapeHtml(summary.periodBasis)}</p>` : '';
+  return `<section class="summary"><h3>历史汇总</h3><div class="summary-grid">${items}</div>${period}</section>`;
+}
+
 function renderUsageDashboard(usages) {
+  const settingsLink = ADMIN_AUTH.enabled ? '<a class="settings-link" href="/admin">设置</a>' : '';
   const accountCards = usages.map(usage => {
     const monthly = usage.monthly ? {
       used: usage.monthly.used,
@@ -2324,9 +2482,10 @@ function renderUsageDashboard(usages) {
       renderUsageMeter('Weekly limit', usage.weekly),
       renderUsageMeter('Monthly limit', monthly),
     ].filter(Boolean).join('');
-    const unavailable = meters || '<p class="empty">官方接口暂未返回可展示的额度窗口。</p>';
+    const summary = renderUsageSummary(usage.summary);
+    const unavailable = (meters || summary) ? `${meters}${summary}` : '<p class="empty">官方接口暂未返回可展示的额度窗口。</p>';
     return `<article class="account-card">
-      <header><div><span class="eyebrow">ACCOUNT</span><h2>${escapeHtml(usage.id)}</h2></div><span class="status ${usage.status === 'ok' ? 'ok' : 'unavailable'}">${usage.status === 'ok' ? '已同步' : '暂不可用'}</span></header>
+      <header><div><span class="eyebrow">ACCOUNT</span><h2>${escapeHtml(usage.alias || usage.id)}</h2><span class="status ${usage.status === 'ok' ? 'ok' : 'unavailable'}">${usage.status === 'ok' ? '已同步' : '暂不可用'} · 优先级 ${escapeHtml(usage.priority ?? '-')}</span></div>${settingsLink}</header>
       ${unavailable}
     </article>`;
   }).join('');
@@ -2337,9 +2496,10 @@ function renderUsageDashboard(usages) {
   :root { color-scheme: dark; --bg:#050505; --panel:#090b0c; --line:#22282b; --text:#eef4f2; --muted:#91a09b; --track:#06271f; --active:#19d5a6; --warning:#f5ae2a; --danger:#ff5f57; }
   * { box-sizing:border-box; } body { margin:0; min-width:320px; background:var(--bg); color:var(--text); font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
   main { width:min(1180px,calc(100% - 32px)); margin:32px auto 48px; } .page-heading { display:flex; gap:16px; justify-content:space-between; align-items:end; margin-bottom:20px; } .eyebrow { color:#a879f7; font-size:12px; letter-spacing:.08em; } h1,h2,h3,p { margin:0; } h1 { font-size:26px; margin-top:6px; } .updated { color:var(--muted); font-size:12px; text-align:right; }
-  .account-grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); } .account-card { background:var(--panel); border:1px solid var(--line); padding:22px; min-width:0; } .account-card header { display:flex; justify-content:space-between; align-items:start; gap:14px; margin-bottom:22px; } h2 { font-size:19px; margin-top:6px; } .status { font-size:12px; white-space:nowrap; padding-top:4px; } .status.ok { color:var(--active); } .status.unavailable { color:var(--danger); }
+  .account-grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); } .account-card { background:var(--panel); border:1px solid var(--line); padding:22px; min-width:0; } .account-card header { display:flex; justify-content:space-between; align-items:start; gap:14px; margin-bottom:22px; } h2 { font-size:19px; margin-top:6px; } .status { display:block; font-size:12px; padding-top:7px; } .status.ok { color:var(--active); } .status.unavailable { color:var(--danger); } .settings-link { color:var(--text); border:1px solid var(--line); padding:6px 9px; text-decoration:none; font-size:12px; }
   .meter + .meter { margin-top:26px; } .meter-heading,.meter-detail { display:flex; justify-content:space-between; gap:12px; } .meter-heading { align-items:baseline; margin-bottom:10px; } h3 { font-size:13px; font-weight:500; letter-spacing:.04em; text-transform:uppercase; } .meter-heading strong { font-size:13px; color:var(--active); } .warning .meter-heading strong { color:var(--warning); } .danger .meter-heading strong { color:var(--danger); }
   .segments { display:grid; grid-template-columns:repeat(24,minmax(0,1fr)); gap:3px; height:27px; } .segment { background:var(--track); } .segment.active { background:var(--active); } .warning .segment.active { background:var(--warning); } .danger .segment.active { background:var(--danger); } .meter-detail { color:var(--muted); font-size:11px; margin-top:8px; min-height:14px; } .empty { color:var(--muted); font-size:13px; padding:16px 0; }
+  .summary { margin-top:26px; border-top:1px solid var(--line); padding-top:18px; } .summary-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-top:12px; } .summary-grid span { background:#060909; padding:8px; color:var(--muted); font-size:11px; } .summary-grid b { display:block; color:var(--text); font-size:12px; margin-bottom:5px; } .summary p { color:var(--muted); font-size:11px; margin-top:10px; }
   @media (max-width:520px) { main { width:min(100% - 20px,1180px); margin-top:20px; } .page-heading { display:block; } .updated { text-align:left; margin-top:8px; } .account-grid { grid-template-columns:1fr; } .account-card { padding:18px; } .meter-detail { display:block; } .meter-detail span + span { display:block; margin-top:4px; } }
 </style></head><body><main>
   <header class="page-heading"><div><span class="eyebrow">◉ USAGE LIMITS</span><h1>Command Code 账号用量</h1></div><p class="updated">更新于 ${escapeHtml(new Date().toLocaleString('zh-CN', { hour12: false }))}</p></header>
@@ -2375,10 +2535,11 @@ async function handleUsage(req, res, url) {
 
   // /usage 必须反映当前值，因此强制刷新；并发请求会共用同一轮上游查询。
   const usages = await refreshPoolUsage(true);
-  const accounts = ACCOUNT_POOL.accounts.map(account => usages.find(usage => usage?.id === account.id) || {
-    id: account.id,
-    status: 'unavailable',
-  });
+  const accounts = ACCOUNT_POOL.accounts.map(account => ({
+    ...(usages.find(usage => usage?.id === account.id) || { id: account.id, status: 'unavailable' }),
+    alias: account.alias,
+    priority: account.priority,
+  }));
   if (clientWantsUsageHtml(req, url)) {
     sendUsageHtml(res, accounts);
     return;
@@ -2392,25 +2553,336 @@ async function handleUsage(req, res, url) {
   });
 }
 
+// ── 管理登录与账号池在线设置 ──────────────────────────
+// The management plane is deliberately separate from the proxy API: it has no
+// CORS, uses a signed-length random HttpOnly session cookie, requires a CSRF
+// token for changes, and writes only to the fixed runtime override path.
+const ADMIN_SESSION_COOKIE = 'cc_proxy_admin';
+const ADMIN_MAX_BODY_SIZE = 64 * 1024;
+const ADMIN_LOGIN_FAILURE_LIMIT = 5;
+const ADMIN_LOGIN_BLOCK_MS = 15 * 60 * 1000;
+const adminSessionStore = new Map();
+const adminLoginAttempts = new Map();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, session] of adminSessionStore) {
+    if (session.expiresAt <= now) adminSessionStore.delete(token);
+  }
+  for (const [ip, attempt] of adminLoginAttempts) {
+    if (attempt.lastSeen + ADMIN_LOGIN_BLOCK_MS <= now && attempt.blockedUntil <= now) adminLoginAttempts.delete(ip);
+  }
+}, 10 * 60 * 1000);
+
+function isAdminRequestAllowed(req) {
+  return ADMIN_AUTH.enabled && (ADMIN_AUTH.allowedIps.includes('*') || ADMIN_AUTH.allowedIps.includes(getRemoteAddress(req)));
+}
+
+function parseRequestCookies(req) {
+  const header = typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
+  const result = new Map();
+  for (const part of header.split(';')) {
+    const separator = part.indexOf('=');
+    if (separator < 1) continue;
+    result.set(part.slice(0, separator).trim(), part.slice(separator + 1).trim());
+  }
+  return result;
+}
+
+function verifyAdminPassword(password) {
+  if (typeof password !== 'string' || password.length === 0 || password.length > 512 || !ADMIN_AUTH.enabled) return false;
+  const stored = parseScryptHash(ADMIN_AUTH.passwordHash);
+  if (!stored) return false;
+  try {
+    const derived = crypto.scryptSync(password, stored.salt, stored.digest.length, {
+      N: stored.N,
+      r: stored.r,
+      p: stored.p,
+      maxmem: 64 * 1024 * 1024,
+    });
+    return crypto.timingSafeEqual(derived, stored.digest);
+  } catch {
+    return false;
+  }
+}
+
+function getLoginAttempt(ip) {
+  const now = Date.now();
+  const attempt = adminLoginAttempts.get(ip);
+  if (!attempt || now - attempt.lastSeen > ADMIN_LOGIN_BLOCK_MS) {
+    const fresh = { failures: 0, blockedUntil: 0, lastSeen: now };
+    adminLoginAttempts.set(ip, fresh);
+    return fresh;
+  }
+  attempt.lastSeen = now;
+  return attempt;
+}
+
+function recordFailedAdminLogin(ip) {
+  const attempt = getLoginAttempt(ip);
+  attempt.failures += 1;
+  if (attempt.failures >= ADMIN_LOGIN_FAILURE_LIMIT) {
+    attempt.blockedUntil = Date.now() + ADMIN_LOGIN_BLOCK_MS;
+    attempt.failures = 0;
+  }
+  if (adminLoginAttempts.size > 10000) adminLoginAttempts.clear();
+}
+
+function getAdminSession(req) {
+  const token = parseRequestCookies(req).get(ADMIN_SESSION_COOKIE);
+  if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
+  const session = adminSessionStore.get(token);
+  if (!session || session.expiresAt <= Date.now() || session.ip !== getRemoteAddress(req)) {
+    if (session) adminSessionStore.delete(token);
+    return null;
+  }
+  return { token, ...session };
+}
+
+function setAdminSessionCookie(res, token, maxAgeSeconds) {
+  const attributes = [
+    `${ADMIN_SESSION_COOKIE}=${token}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Strict',
+    `Max-Age=${maxAgeSeconds}`,
+  ];
+  if (ADMIN_AUTH.secureCookie) attributes.push('Secure');
+  res.setHeader('Set-Cookie', attributes.join('; '));
+}
+
+function clearAdminSessionCookie(res) {
+  const attributes = [`${ADMIN_SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Strict', 'Max-Age=0'];
+  if (ADMIN_AUTH.secureCookie) attributes.push('Secure');
+  res.setHeader('Set-Cookie', attributes.join('; '));
+}
+
+function requireAdmin(req, res, requireCsrf = false) {
+  if (!ADMIN_AUTH.enabled) {
+    sendJSON(res, 404, { error: { message: 'Admin settings are not enabled', type: 'not_found' } });
+    return null;
+  }
+  if (!isAdminRequestAllowed(req)) {
+    sendJSON(res, 403, { error: { message: 'Admin settings are restricted to configured source IPs', type: 'access_denied' } });
+    return null;
+  }
+  const session = getAdminSession(req);
+  if (!session) {
+    sendJSON(res, 401, { error: { message: 'Admin login required', type: 'authentication_error' } });
+    return null;
+  }
+  if (requireCsrf && !timingSafeStringEqual(String(req.headers['x-csrf-token'] || ''), session.csrfToken)) {
+    sendJSON(res, 403, { error: { message: 'Invalid CSRF token', type: 'csrf_failed' } });
+    return null;
+  }
+  return session;
+}
+
+function sanitizedAdminAccounts() {
+  const configured = Array.isArray(CFG.accountPool?.accounts) ? CFG.accountPool.accounts : [];
+  return configured.map((account, index) => {
+    const active = ACCOUNT_POOL.configuredAccounts?.find(item => item.id === account.id);
+    const state = poolUsageStore.get(account.id);
+    return {
+      id: account.id,
+      alias: active?.alias ?? normalizeAccountAlias(account.alias, account.id),
+      priority: active?.priority ?? normalizeAccountPriority(account.priority, index),
+      enabled: active?.enabled ?? account.enabled !== false,
+      hasApiKey: typeof account.apiKey === 'string' && COMMAND_CODE_KEY_RE.test(account.apiKey),
+      status: state?.usage?.status ?? 'not_checked',
+    };
+  });
+}
+
+function buildAdminState(session) {
+  return {
+    object: 'admin_account_pool_settings',
+    csrfToken: session.csrfToken,
+    accountPool: {
+      enabled: CFG.accountPool?.enabled === true,
+      selectionStrategy: CFG.accountPool?.selectionStrategy ?? 'priority',
+      usageRefreshIntervalMs: CFG.accountPool?.usageRefreshIntervalMs ?? 60000,
+      accounts: sanitizedAdminAccounts(),
+    },
+  };
+}
+
+function assertOnlyAllowedKeys(value, allowed, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !allowed.has(key))) {
+    throw new Error(`${label} has unsupported fields`);
+  }
+}
+
+function buildUpdatedAccountPool(body) {
+  assertOnlyAllowedKeys(body, new Set(['enabled', 'proxyKey', 'selectionStrategy', 'usageRefreshIntervalMs', 'accounts']), 'settings request');
+  if (!Array.isArray(body.accounts)) throw new Error('settings request accounts must be an array');
+  const current = CFG.accountPool && typeof CFG.accountPool === 'object' ? CFG.accountPool : {};
+  const currentAccounts = new Map((Array.isArray(current.accounts) ? current.accounts : []).map(account => [account.id, account]));
+  const next = {
+    enabled: body.enabled === undefined ? current.enabled === true : body.enabled,
+    proxyKey: body.proxyKey === undefined || body.proxyKey === '' ? current.proxyKey : body.proxyKey,
+    selectionStrategy: body.selectionStrategy ?? current.selectionStrategy ?? 'priority',
+    usageRefreshIntervalMs: body.usageRefreshIntervalMs ?? current.usageRefreshIntervalMs ?? 60000,
+    accounts: body.accounts.map((account, index) => {
+      assertOnlyAllowedKeys(account, new Set(['id', 'alias', 'priority', 'enabled', 'apiKey']), `accounts[${index}]`);
+      const prior = currentAccounts.get(account.id);
+      const submittedKey = account.apiKey === undefined ? '' : account.apiKey;
+      if (typeof submittedKey !== 'string') throw new Error(`accounts[${index}].apiKey must be a string`);
+      const apiKey = submittedKey.trim() || prior?.apiKey;
+      if (!apiKey) throw new Error(`accounts[${index}] requires an apiKey for a new account`);
+      return {
+        id: account.id,
+        alias: account.alias,
+        priority: account.priority,
+        enabled: account.enabled !== false,
+        apiKey,
+      };
+    }),
+  };
+  if (typeof next.enabled !== 'boolean') throw new Error('enabled must be a boolean');
+  // Validate the complete candidate before writing anything to disk.
+  normalizeAccountPool(next);
+  return next;
+}
+
+function persistAccountPoolOverride(accountPool) {
+  mkdirSync(RUNTIME_DATA_DIR, { recursive: true, mode: 0o700 });
+  const temporaryPath = resolve(RUNTIME_DATA_DIR, `.account-pool.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+  const serialized = `${JSON.stringify({ version: 1, accountPool }, null, 2)}\n`;
+  try {
+    writeFileSync(temporaryPath, serialized, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    renameSync(temporaryPath, ACCOUNT_POOL_OVERRIDE_PATH);
+    try { chmodSync(ACCOUNT_POOL_OVERRIDE_PATH, 0o600); } catch {}
+  } catch (e) {
+    try { if (existsSync(temporaryPath)) unlinkSync(temporaryPath); } catch {}
+    throw new Error(`could not persist account settings: ${e.message}`);
+  }
+}
+
+function applyAccountPoolSettings(accountPool) {
+  const nextPool = normalizeAccountPool(accountPool);
+  CFG.accountPool = accountPool;
+  ACCOUNT_POOL = nextPool;
+  poolUsageStore.clear();
+  poolCursor = 0;
+  poolUsageRefreshPromise = null;
+  sessionStore.clear();
+  keyStateStore.clear();
+  dynamicModels = null;
+  modelsLastFetch = 0;
+}
+
+async function handleAdminLogin(req, res) {
+  if (!ADMIN_AUTH.enabled) {
+    sendJSON(res, 404, { error: { message: 'Admin settings are not enabled', type: 'not_found' } });
+    return;
+  }
+  const ip = getRemoteAddress(req);
+  if (!isAdminRequestAllowed(req)) {
+    sendJSON(res, 403, { error: { message: 'Admin settings are restricted to configured source IPs', type: 'access_denied' } });
+    return;
+  }
+  const attempt = getLoginAttempt(ip);
+  if (attempt.blockedUntil > Date.now()) {
+    sendJSON(res, 429, { error: { message: 'Too many login attempts; try again later', type: 'rate_limit_error' } });
+    return;
+  }
+  let body;
+  try {
+    body = await readBody(req, ADMIN_MAX_BODY_SIZE);
+    assertOnlyAllowedKeys(body, new Set(['password']), 'login request');
+  } catch {
+    sendJSON(res, 400, { error: { message: 'Invalid login request', type: 'invalid_request_error' } });
+    return;
+  }
+  if (!verifyAdminPassword(body.password)) {
+    recordFailedAdminLogin(ip);
+    log('warn', 'Admin login failed', { ip });
+    sendJSON(res, 401, { error: { message: 'Invalid credentials', type: 'authentication_error' } });
+    return;
+  }
+  adminLoginAttempts.delete(ip);
+  const token = crypto.randomBytes(32).toString('base64url');
+  const session = { ip, csrfToken: crypto.randomBytes(24).toString('base64url'), expiresAt: Date.now() + ADMIN_AUTH.sessionTtlMs };
+  adminSessionStore.set(token, session);
+  setAdminSessionCookie(res, token, Math.floor(ADMIN_AUTH.sessionTtlMs / 1000));
+  log('info', 'Admin login succeeded', { ip });
+  sendJSON(res, 200, buildAdminState(session));
+}
+
+async function handleAdminSettingsUpdate(req, res) {
+  const session = requireAdmin(req, res, true);
+  if (!session) return;
+  let body;
+  try {
+    body = await readBody(req, ADMIN_MAX_BODY_SIZE);
+    const next = buildUpdatedAccountPool(body);
+    persistAccountPoolOverride(next);
+    applyAccountPoolSettings(next);
+    log('info', 'Admin account-pool settings reloaded', { accountCount: next.accounts.length, enabled: next.enabled, strategy: next.selectionStrategy });
+  } catch (e) {
+    log('warn', 'Admin account-pool settings rejected', { message: e.message });
+    sendJSON(res, 400, { error: { message: 'Settings were not saved: invalid configuration', type: 'invalid_request_error' } });
+    return;
+  }
+  sendJSON(res, 200, buildAdminState(session));
+}
+
+function handleAdminLogout(req, res) {
+  const session = requireAdmin(req, res, true);
+  if (!session) return;
+  adminSessionStore.delete(session.token);
+  clearAdminSessionCookie(res);
+  sendJSON(res, 204, null);
+}
+
+function renderAdminPage() {
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>账号池设置</title><style>
+:root{color-scheme:dark;--bg:#050505;--panel:#0b0e10;--line:#263034;--text:#eef4f2;--muted:#9aa9a4;--accent:#19d5a6;--danger:#ff6b66}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}main{width:min(1180px,calc(100% - 32px));margin:32px auto}h1,h2,p{margin:0}h1{font-size:25px}.muted{color:var(--muted)}.panel{margin-top:18px;padding:22px;border:1px solid var(--line);background:var(--panel)}.hidden{display:none}.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.space{justify-content:space-between}.account{display:grid;grid-template-columns:1.1fr 1fr 90px 110px 1.6fr auto;gap:10px;border-top:1px solid var(--line);padding:12px 0}.account:first-child{border-top:0}label{display:grid;gap:6px;color:var(--muted);font-size:12px}input,select,button{font:inherit}input,select{width:100%;background:#050707;border:1px solid #344046;color:var(--text);padding:9px;border-radius:4px}button{border:1px solid var(--accent);background:var(--accent);color:#03100c;padding:9px 13px;border-radius:4px;cursor:pointer;font-weight:700}button.secondary{background:transparent;color:var(--text);border-color:var(--line)}button.danger{border-color:var(--danger);color:var(--danger)}#message{min-height:20px;margin-top:14px;color:var(--accent)}#message.error{color:var(--danger)}@media(max-width:820px){.account{grid-template-columns:1fr 1fr}.account button{align-self:end}}@media(max-width:480px){main{width:min(100% - 20px,1180px)}.account{grid-template-columns:1fr}}
+</style></head><body><main>
+<header class="row space"><div><p class="muted">ADMIN SETTINGS</p><h1>账号池设置</h1></div><a class="muted" href="/usage">返回用量</a></header>
+<section id="login" class="panel"><h2>登录</h2><form id="loginForm" class="row" style="margin-top:14px"><label style="min-width:min(320px,100%)">管理密码<input id="password" type="password" autocomplete="current-password" required></label><button>登录</button></form></section>
+<section id="settings" class="panel hidden"><div class="row space"><h2>在线配置</h2><button id="logout" class="secondary">退出</button></div><p class="muted" style="margin:10px 0 18px">留空的账号 Key 与专属代理 Key 会保留原值；保存后立即在内存重载，并持久化到 Docker 数据卷。</p><div class="row"><label><span>账号池</span><select id="poolEnabled"><option value="true">启用</option><option value="false">停用</option></select></label><label><span>选择策略</span><select id="strategy"><option value="priority">按优先级</option><option value="earliest_monthly_reset">月度重置时间优先</option><option value="round_robin">轮询</option></select></label><label><span>额度刷新间隔（毫秒）</span><input id="refresh" type="number" min="15000" max="900000"></label><label style="min-width:280px"><span>替换专属代理 Key（可选）</span><input id="proxyKey" type="password" autocomplete="new-password" placeholder="留空保留当前值"></label></div><div id="accounts" style="margin-top:18px"></div><div class="row" style="margin-top:16px"><button id="add" type="button" class="secondary">添加账号</button><button id="save" type="button">保存并重载</button></div></section><p id="message" role="status"></p>
+</main><script>
+let state=null;let csrf='';const $=id=>document.getElementById(id);const message=(text,error=false)=>{const el=$('message');el.textContent=text;el.className=error?'error':''};
+async function api(path,options={}){const response=await fetch(path,{credentials:'same-origin',headers:{'Content-Type':'application/json',...(options.headers||{})},...options});let data=null;try{data=await response.json()}catch{}if(!response.ok)throw new Error(data?.error?.message||'请求失败');return data}
+function row(account={id:'',alias:'',priority:1,enabled:true,hasApiKey:false,status:'new'}){const el=document.createElement('div');el.className='account';for(const [name,label,type,value] of [['id','ID','text',account.id],['alias','别名','text',account.alias],['priority','优先级','number',account.priority]]){const wrap=document.createElement('label');wrap.textContent=label;const input=document.createElement('input');input.dataset.field=name;input.type=type;input.value=value;input.required=true;if(name==='priority'){input.min='1';input.max='1000'}wrap.append(input);el.append(wrap)}const enabled=document.createElement('label');enabled.textContent='状态';const select=document.createElement('select');select.dataset.field='enabled';select.innerHTML='<option value="true">启用</option><option value="false">停用</option>';select.value=String(account.enabled);enabled.append(select);el.append(enabled);const key=document.createElement('label');key.textContent=account.hasApiKey?'替换 Key（留空保留）':'Command Code Key';const keyInput=document.createElement('input');keyInput.dataset.field='apiKey';keyInput.type='password';keyInput.autocomplete='new-password';keyInput.placeholder=account.hasApiKey?'留空保留现有 Key':'user_…';key.append(keyInput);el.append(key);const remove=document.createElement('button');remove.type='button';remove.className='secondary danger';remove.textContent='移除';remove.onclick=()=>el.remove();el.append(remove);return el}
+function render(next){state=next;csrf=next.csrfToken;$('poolEnabled').value=String(next.accountPool.enabled);$('strategy').value=next.accountPool.selectionStrategy;$('refresh').value=next.accountPool.usageRefreshIntervalMs;const target=$('accounts');target.replaceChildren(...next.accountPool.accounts.map(row));$('login').classList.add('hidden');$('settings').classList.remove('hidden')}
+$('loginForm').addEventListener('submit',async event=>{event.preventDefault();try{render(await api('/api/admin/login',{method:'POST',body:JSON.stringify({password:$('password').value})}));$('password').value='';message('登录成功')}catch(error){message(error.message,true)}});
+$('add').onclick=()=>$('accounts').append(row({priority:$('accounts').children.length+1}));$('save').onclick=async()=>{try{const accounts=[...$('accounts').children].map(el=>({id:el.querySelector('[data-field=id]').value.trim(),alias:el.querySelector('[data-field=alias]').value.trim(),priority:Number(el.querySelector('[data-field=priority]').value),enabled:el.querySelector('[data-field=enabled]').value==='true',apiKey:el.querySelector('[data-field=apiKey]').value.trim()}));render(await api('/api/admin/account-pool',{method:'PUT',headers:{'X-CSRF-Token':csrf},body:JSON.stringify({enabled:$('poolEnabled').value==='true',selectionStrategy:$('strategy').value,usageRefreshIntervalMs:Number($('refresh').value),proxyKey:$('proxyKey').value,accounts})}));$('proxyKey').value='';message('已保存并立即重载')}catch(error){message(error.message,true)}};
+$('logout').onclick=async()=>{try{await api('/api/admin/logout',{method:'POST',headers:{'X-CSRF-Token':csrf}});}catch{}state=null;csrf='';$('settings').classList.add('hidden');$('login').classList.remove('hidden');message('已退出')};
+</script></body></html>`;
+}
+
+function sendAdminPage(res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+  });
+  res.end(renderAdminPage());
+}
+
 // ── 服务器 ──────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
+  const host = req.headers.host || 'localhost';
+  const url = new URL(req.url, `http://${host}`);
+  const privateRoute = url.pathname === '/usage' || url.pathname === '/admin' || url.pathname.startsWith('/api/admin/');
+  if (!privateRoute) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+  }
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
     return;
-  }
-
-  const host = req.headers.host || 'localhost';
-  const url = new URL(req.url, `http://${host}`);
-  if (url.pathname === '/usage') {
-    // 额度数据不应提供给跨站脚本读取；该端点仍然无需 API Key。
-    res.removeHeader('Access-Control-Allow-Origin');
-    res.removeHeader('Access-Control-Allow-Headers');
   }
 
   try {
@@ -2422,13 +2894,27 @@ const server = http.createServer(async (req, res) => {
       await handleModels(req, res);
     } else if (url.pathname === '/usage' && req.method === 'GET') {
       await handleUsage(req, res, url);
+    } else if (url.pathname === '/admin' && req.method === 'GET') {
+      if (!ADMIN_AUTH.enabled) sendJSON(res, 404, { error: { message: 'Admin settings are not enabled', type: 'not_found' } });
+      else if (!isAdminRequestAllowed(req)) sendJSON(res, 403, { error: { message: 'Admin settings are restricted to configured source IPs', type: 'access_denied' } });
+      else sendAdminPage(res);
+    } else if (url.pathname === '/api/admin/login' && req.method === 'POST') {
+      await handleAdminLogin(req, res);
+    } else if (url.pathname === '/api/admin/logout' && req.method === 'POST') {
+      handleAdminLogout(req, res);
+    } else if (url.pathname === '/api/admin/state' && req.method === 'GET') {
+      const session = requireAdmin(req, res);
+      if (session) sendJSON(res, 200, buildAdminState(session));
+    } else if (url.pathname === '/api/admin/account-pool' && req.method === 'PUT') {
+      await handleAdminSettingsUpdate(req, res);
     } else if (url.pathname === '/health' || url.pathname === '/') {
       handleHealth(req, res);
     } else {
       sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
     }
   } catch (e) {
-    sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
+    log('error', 'HTTP request failed', { path: url.pathname, message: e?.message || 'unknown error' });
+    sendJSON(res, 500, { error: { message: 'Internal server error', type: 'internal_error' } });
   }
 });
 

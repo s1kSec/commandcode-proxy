@@ -7,16 +7,23 @@
   "logFile": "",
   "logLevel": "info",
   "usageAllowedIps": ["*"],
+  "adminAuth": {
+    "enabled": false,
+    "passwordHash": "",
+    "allowedIps": ["127.0.0.1", "::1"],
+    "sessionTtlMinutes": 120,
+    "secureCookie": true
+  },
   "accountPool": {
     "enabled": false,
     "proxyKey": "replace-with-a-random-secret-at-least-24-characters",
     "usageRefreshIntervalMs": 60000,
-    "selectionStrategy": "earliest_monthly_reset",
+    "selectionStrategy": "priority",
     "accounts": [
-      { "id": "account-1", "apiKey": "user_replace_with_first_commandcode_key", "enabled": true },
-      { "id": "account-2", "apiKey": "user_replace_with_second_commandcode_key", "enabled": true },
-      { "id": "account-3", "apiKey": "user_replace_with_third_commandcode_key", "enabled": true },
-      { "id": "account-4", "apiKey": "user_replace_with_fourth_commandcode_key", "enabled": true }
+      { "id": "account-1", "alias": "账号 1", "priority": 1, "apiKey": "user_replace_with_first_commandcode_key", "enabled": true },
+      { "id": "account-2", "alias": "账号 2", "priority": 2, "apiKey": "user_replace_with_second_commandcode_key", "enabled": true },
+      { "id": "account-3", "alias": "账号 3", "priority": 3, "apiKey": "user_replace_with_third_commandcode_key", "enabled": true },
+      { "id": "account-4", "alias": "账号 4", "priority": 4, "apiKey": "user_replace_with_fourth_commandcode_key", "enabled": true }
     ]
   }
 }
