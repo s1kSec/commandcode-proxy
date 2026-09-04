@@ -438,7 +438,13 @@ If the configuration file is missing, invalid JSON, `accountPool.enabled` is not
 
 For an enabled account pool, `selectionStrategy` defaults to `priority`: lower account priority numbers are used first and the proxy advances only when a higher-priority account is known to be exhausted or the upstream returns a quota error before output. `earliest_monthly_reset` and `round_robin` remain available. Accounts with an exhausted reported 5-hour or weekly window are skipped until their reset time.
 
-Optional online account settings are protected by `adminAuth` in `config.json`. Enable it only with a `scrypt$16384$8$1$<salt-base64url>$<hash-base64url>` password hash, an explicit `allowedIps` list, and HTTPS (`secureCookie: true`). The `/admin` page uses an HttpOnly SameSite session, CSRF token, rate-limited login, and no CORS. It writes only an account-pool override to the persistent `runtime-data` Docker volume; the read-only base config is never made writable and real keys are never returned by the page or API.
+Optional online account settings are protected by `adminAuth` in `config.json`. Enable it only with a `scrypt$16384$8$1$<salt-base64url>$<hash-base64url>` password hash, an explicit `allowedIps` list, and HTTPS (`secureCookie: true`). The `/admin` page verifies that the new session cookie is usable before showing settings, uses an HttpOnly SameSite cookie, requires a CSRF token for changes, rate-limits login, and has no CORS. It writes only an account-pool override to the persistent `runtime-data` Docker volume; the read-only base config is never made writable and real keys are never returned by the page or API.
+
+The checked-in configuration uses `"allowedIps": ["*"]`, so the admin login is reachable from every public source IP once `adminAuth.enabled` is enabled with a valid password hash. Public reachability does not make plain HTTP safe: keep `secureCookie: true` and terminate HTTPS before the application, otherwise the server rejects the login.
+
+When TLS terminates at Nginx, Caddy, or another reverse proxy, add only that proxy's direct backend-facing IP to `adminAuth.trustedProxyIps`, for example `"trustedProxyIps": ["172.17.0.1"]`, and make the proxy overwrite `X-Forwarded-Proto` with `https` and `X-Forwarded-For` with the real client address (or append the real address as the final value). The application accepts these headers only from the exact trusted addresses and uses the final forwarded address only for per-client login throttling; `"*"` is deliberately invalid for proxy trust. A public plain-HTTP admin login is rejected instead of appearing to log in and then losing its `Secure` cookie. `secureCookie: false` remains restricted to loopback-only administration.
+
+The browser `/usage` dashboard now returns its HTML immediately and refreshes accounts asynchronously. Accounts and faster monthly limits appear as soon as they arrive; 5-hour, weekly, and history data are filled in without blocking the first page render. Existing JSON clients retain the blocking current-value behavior. A UI or monitor that needs a non-blocking snapshot can call `/usage?format=json&async=1&refresh=1` once to start a refresh, then poll `/usage?format=json&async=1` until `refreshing` is `false`.
 
 The proxy will listen on `http://0.0.0.0:3050`. Set `PROXY_PORT` to customize the host port:
 
@@ -467,6 +473,14 @@ npm run docker:build:multi
 |----------|---------|-------------|
 | `PORT` | `3050` | Container listen port |
 | `PROXY_PORT` | `3050` | Host port (compose only) |
+
+### Tests
+
+The regression tests use only local mock upstreams and placeholder keys; they never call Command Code or print configured secrets:
+
+```bash
+npm test
+```
 
 ## Disclaimer
 

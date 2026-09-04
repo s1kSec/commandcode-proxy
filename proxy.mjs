@@ -55,6 +55,7 @@ function loadConfig() {
       enabled: false,
       passwordHash: '',
       allowedIps: ['127.0.0.1', '::1'],
+      trustedProxyIps: [],
       sessionTtlMinutes: 120,
       secureCookie: true,
     },
@@ -157,6 +158,10 @@ function normalizeAdminAuth(rawAuth) {
   if (!Array.isArray(rawAuth.allowedIps) || rawAuth.allowedIps.length === 0 || rawAuth.allowedIps.some(ip => typeof ip !== 'string' || (ip !== '*' && isIP(ip) === 0))) {
     throw new Error('adminAuth.allowedIps must contain "*" and/or literal IPv4/IPv6 addresses');
   }
+  const trustedProxyIps = rawAuth.trustedProxyIps ?? [];
+  if (!Array.isArray(trustedProxyIps) || trustedProxyIps.some(ip => typeof ip !== 'string' || isIP(ip) === 0)) {
+    throw new Error('adminAuth.trustedProxyIps must contain only literal IPv4/IPv6 addresses');
+  }
   const sessionTtlMinutes = Number(rawAuth.sessionTtlMinutes ?? 120);
   if (!Number.isInteger(sessionTtlMinutes) || sessionTtlMinutes < 5 || sessionTtlMinutes > 720) {
     throw new Error('adminAuth.sessionTtlMinutes must be an integer from 5 to 720');
@@ -172,6 +177,7 @@ function normalizeAdminAuth(rawAuth) {
     enabled: true,
     passwordHash: rawAuth.passwordHash,
     allowedIps: rawAuth.allowedIps,
+    trustedProxyIps,
     sessionTtlMs: sessionTtlMinutes * 60 * 1000,
     secureCookie: rawAuth.secureCookie !== false,
   };
@@ -489,6 +495,7 @@ async function ensureInitialized(apiKey, signal) {
 const poolUsageStore = new Map(); // account id -> sanitized usage + availability state
 let poolCursor = 0;
 let poolUsageRefreshPromise = null;
+let poolUsageGeneration = 0;
 
 function timingSafeStringEqual(left, right) {
   if (typeof left !== 'string' || typeof right !== 'string') return false;
@@ -601,7 +608,19 @@ function buildUsageQuery(path, params) {
   return encoded ? `${path}?${encoded}` : path;
 }
 
-async function refreshAccountUsage(account) {
+function storeAccountUsage(account, usage, generation) {
+  // 在线设置可能在上游请求尚未完成时重载。旧一代请求不得覆盖新账号状态。
+  if (generation !== poolUsageGeneration) return;
+  const previous = poolUsageStore.get(account.id);
+  poolUsageStore.set(account.id, {
+    ...previous,
+    usage,
+    fetchedAtMs: Date.now(),
+    blockedUntil: previous?.blockedUntil && previous.blockedUntil > Date.now() ? previous.blockedUntil : 0,
+  });
+}
+
+async function refreshAccountUsage(account, generation) {
   const whoami = await fetchUsageJson('/alpha/whoami', account.apiKey);
   const orgId = whoami.data?.org?.id ?? null;
   const [creditsResponse, subscriptionResponse] = await Promise.all([
@@ -609,8 +628,6 @@ async function refreshAccountUsage(account) {
     fetchUsageJson(buildUsageQuery('/alpha/billing/subscriptions', { orgId }), account.apiKey),
   ]);
   const currentPeriodStart = subscriptionResponse.data?.data?.currentPeriodStart ?? null;
-  const summaryResponse = await fetchUsageJson(buildUsageQuery('/alpha/usage/summary', { orgId, since: currentPeriodStart }), account.apiKey);
-
   const credits = creditsResponse.data?.credits ?? null;
   const subscription = subscriptionResponse.data?.data ?? null;
   const planId = credits?.planId ?? subscription?.planId ?? null;
@@ -626,14 +643,12 @@ async function refreshAccountUsage(account) {
     credits?.windowLimits,
     subscriptionResponse.data?.windowLimits,
     subscription?.windowLimits,
-    summaryResponse.data?.windowLimits,
   );
   const fiveHour = normalizeUsageWindow(windowLimits?.fiveHour ?? windowLimits?.five_hour);
   const weekly = normalizeUsageWindow(windowLimits?.weekly);
-  const summary = normalizeUsageSummary(summaryResponse.data);
   const fetchedAt = new Date().toISOString();
 
-  const usage = {
+  let usage = {
     id: account.id,
     status: creditsResponse.ok && subscriptionResponse.ok ? 'ok' : 'unavailable',
     fetchedAt,
@@ -650,17 +665,29 @@ async function refreshAccountUsage(account) {
     // If the official response gives a concrete rolling window but omits the
     // optional `limited` flag, it is still safe to avoid an exhausted window.
     limited: windowLimits?.limited === true || (windowLimits?.limited !== false && Boolean(fiveHour || weekly)),
-    totalCost: summary?.totalCost ?? null,
-    summary,
+    totalCost: null,
+    summary: null,
   };
+  // 额度端点先完成就先发布，历史汇总较慢时页面仍可立刻显示月度额度。
+  storeAccountUsage(account, usage, generation);
 
-  const previous = poolUsageStore.get(account.id);
-  poolUsageStore.set(account.id, {
-    ...previous,
-    usage,
-    fetchedAtMs: Date.now(),
-    blockedUntil: previous?.blockedUntil && previous.blockedUntil > Date.now() ? previous.blockedUntil : 0,
-  });
+  const summaryResponse = await fetchUsageJson(buildUsageQuery('/alpha/usage/summary', { orgId, since: currentPeriodStart }), account.apiKey);
+  const summaryWindowLimits = pickUsageWindowLimits(summaryResponse.data?.windowLimits);
+  const summary = normalizeUsageSummary(summaryResponse.data);
+  if (summaryWindowLimits) {
+    const summaryFiveHour = normalizeUsageWindow(summaryWindowLimits.fiveHour ?? summaryWindowLimits.five_hour);
+    const summaryWeekly = normalizeUsageWindow(summaryWindowLimits.weekly);
+    usage = {
+      ...usage,
+      fiveHour: summaryFiveHour ?? usage.fiveHour,
+      weekly: summaryWeekly ?? usage.weekly,
+      limited: summaryWindowLimits.limited === true
+        || (summaryWindowLimits.limited !== false && Boolean(summaryFiveHour || summaryWeekly))
+        || usage.limited,
+    };
+  }
+  usage = { ...usage, totalCost: summary?.totalCost ?? null, summary, fetchedAt: new Date().toISOString() };
+  storeAccountUsage(account, usage, generation);
   return usage;
 }
 
@@ -674,11 +701,18 @@ async function refreshPoolUsage(force = false) {
   if (!force && !stale) return ACCOUNT_POOL.accounts.map(account => poolUsageStore.get(account.id)?.usage).filter(Boolean);
   if (poolUsageRefreshPromise) return poolUsageRefreshPromise;
 
-  poolUsageRefreshPromise = Promise.all(ACCOUNT_POOL.accounts.map(async account => {
-    try { return await refreshAccountUsage(account); }
+  const generation = poolUsageGeneration;
+  const accounts = [...ACCOUNT_POOL.accounts];
+  const refresh = Promise.all(accounts.map(async account => {
+    try { return await refreshAccountUsage(account, generation); }
     catch { return poolUsageStore.get(account.id)?.usage ?? { id: account.id, status: 'unavailable' }; }
-  })).finally(() => { poolUsageRefreshPromise = null; });
-  return poolUsageRefreshPromise;
+  }));
+  poolUsageRefreshPromise = refresh;
+  try {
+    return await refresh;
+  } finally {
+    if (poolUsageRefreshPromise === refresh) poolUsageRefreshPromise = null;
+  }
 }
 
 function windowIsExhausted(window) {
@@ -1232,19 +1266,29 @@ function readBody(req, maxBodySize = MAX_BODY_SIZE) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalSize = 0;
+    let settled = false;
     req.on('data', c => {
+      if (settled) return;
       totalSize += c.length;
       if (totalSize > maxBodySize) {
+        settled = true;
         req.destroy(new Error('Request body too large'));
         reject(new Error('Request body exceeds configured size limit'));
+        return;
       }
       chunks.push(c);
     });
     req.on('end', () => {
+      if (settled) return;
+      settled = true;
       try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
       catch { reject(new Error('Invalid JSON')); }
     });
-    req.on('error', reject);
+    req.on('error', error => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    });
   });
 }
 
@@ -1271,7 +1315,9 @@ function getRequestCredential(headers) {
 async function getApiKey(headers) {
   const credential = getRequestCredential(headers);
   if (isPoolProxyKey(credential)) {
-    await refreshPoolUsage();
+    // 路由不能被额度接口拖住：先按已有状态选账号，并在后台更新额度。
+    // 真正的上游配额错误仍沿用原有 failover 流程切换账号。
+    void refreshPoolUsage().catch(error => log('warn', 'Background pool usage refresh failed', { message: error.message }));
     // 所有账号已被本地标记为耗尽时，仍交给上游返回规范的 429，而非误报为缺少 Key。
     return selectPoolAccount()?.apiKey || ACCOUNT_POOL.accounts[0]?.apiKey || null;
   }
@@ -2469,7 +2515,7 @@ function renderUsageSummary(summary) {
   return `<section class="summary"><h3>历史汇总</h3><div class="summary-grid">${items}</div>${period}</section>`;
 }
 
-function renderUsageDashboard(usages) {
+function renderUsageDashboard(usages, scriptNonce) {
   const settingsLink = ADMIN_AUTH.enabled ? '<a class="settings-link" href="/admin">设置</a>' : '';
   const accountCards = usages.map(usage => {
     const monthly = usage.monthly ? {
@@ -2483,9 +2529,11 @@ function renderUsageDashboard(usages) {
       renderUsageMeter('Monthly limit', monthly),
     ].filter(Boolean).join('');
     const summary = renderUsageSummary(usage.summary);
-    const unavailable = (meters || summary) ? `${meters}${summary}` : '<p class="empty">官方接口暂未返回可展示的额度窗口。</p>';
+    const pending = usage.status === 'loading' || usage.status === 'not_checked';
+    const unavailable = (meters || summary) ? `${meters}${summary}` : `<p class="empty">${pending ? '正在读取额度…' : '官方接口暂未返回可展示的额度窗口。'}</p>`;
+    const statusText = usage.status === 'ok' ? '已同步' : pending ? '加载中' : '暂不可用';
     return `<article class="account-card">
-      <header><div><span class="eyebrow">ACCOUNT</span><h2>${escapeHtml(usage.alias || usage.id)}</h2><span class="status ${usage.status === 'ok' ? 'ok' : 'unavailable'}">${usage.status === 'ok' ? '已同步' : '暂不可用'} · 优先级 ${escapeHtml(usage.priority ?? '-')}</span></div>${settingsLink}</header>
+      <header><div><span class="eyebrow">ACCOUNT</span><h2>${escapeHtml(usage.alias || usage.id)}</h2><span class="status ${usage.status === 'ok' ? 'ok' : pending ? 'loading' : 'unavailable'}">${statusText} · 优先级 ${escapeHtml(usage.priority ?? '-')}</span></div></header>
       ${unavailable}
     </article>`;
   }).join('');
@@ -2495,16 +2543,29 @@ function renderUsageDashboard(usages) {
 <title>Command Code 用量</title><style>
   :root { color-scheme: dark; --bg:#050505; --panel:#090b0c; --line:#22282b; --text:#eef4f2; --muted:#91a09b; --track:#06271f; --active:#19d5a6; --warning:#f5ae2a; --danger:#ff5f57; }
   * { box-sizing:border-box; } body { margin:0; min-width:320px; background:var(--bg); color:var(--text); font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace; }
-  main { width:min(1180px,calc(100% - 32px)); margin:32px auto 48px; } .page-heading { display:flex; gap:16px; justify-content:space-between; align-items:end; margin-bottom:20px; } .eyebrow { color:#a879f7; font-size:12px; letter-spacing:.08em; } h1,h2,h3,p { margin:0; } h1 { font-size:26px; margin-top:6px; } .updated { color:var(--muted); font-size:12px; text-align:right; }
+  main { width:min(1180px,calc(100% - 32px)); margin:32px auto 48px; } .page-heading { display:flex; gap:16px; justify-content:space-between; align-items:end; margin-bottom:20px; } .eyebrow { color:#a879f7; font-size:12px; letter-spacing:.08em; } h1,h2,h3,p { margin:0; } h1 { font-size:26px; margin-top:6px; } .toolbar { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:8px; } .updated { color:var(--muted); font-size:12px; text-align:right; }
   .account-grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); } .account-card { background:var(--panel); border:1px solid var(--line); padding:22px; min-width:0; } .account-card header { display:flex; justify-content:space-between; align-items:start; gap:14px; margin-bottom:22px; } h2 { font-size:19px; margin-top:6px; } .status { display:block; font-size:12px; padding-top:7px; } .status.ok { color:var(--active); } .status.unavailable { color:var(--danger); } .settings-link { color:var(--text); border:1px solid var(--line); padding:6px 9px; text-decoration:none; font-size:12px; }
+  .status.loading { color:var(--warning); } button { color:var(--text); border:1px solid var(--line); background:transparent; padding:6px 9px; font:inherit; font-size:12px; cursor:pointer; } button:disabled { opacity:.55; cursor:wait; }
   .meter + .meter { margin-top:26px; } .meter-heading,.meter-detail { display:flex; justify-content:space-between; gap:12px; } .meter-heading { align-items:baseline; margin-bottom:10px; } h3 { font-size:13px; font-weight:500; letter-spacing:.04em; text-transform:uppercase; } .meter-heading strong { font-size:13px; color:var(--active); } .warning .meter-heading strong { color:var(--warning); } .danger .meter-heading strong { color:var(--danger); }
   .segments { display:grid; grid-template-columns:repeat(24,minmax(0,1fr)); gap:3px; height:27px; } .segment { background:var(--track); } .segment.active { background:var(--active); } .warning .segment.active { background:var(--warning); } .danger .segment.active { background:var(--danger); } .meter-detail { color:var(--muted); font-size:11px; margin-top:8px; min-height:14px; } .empty { color:var(--muted); font-size:13px; padding:16px 0; }
   .summary { margin-top:26px; border-top:1px solid var(--line); padding-top:18px; } .summary-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-top:12px; } .summary-grid span { background:#060909; padding:8px; color:var(--muted); font-size:11px; } .summary-grid b { display:block; color:var(--text); font-size:12px; margin-bottom:5px; } .summary p { color:var(--muted); font-size:11px; margin-top:10px; }
-  @media (max-width:520px) { main { width:min(100% - 20px,1180px); margin-top:20px; } .page-heading { display:block; } .updated { text-align:left; margin-top:8px; } .account-grid { grid-template-columns:1fr; } .account-card { padding:18px; } .meter-detail { display:block; } .meter-detail span + span { display:block; margin-top:4px; } }
+  @media (max-width:520px) { main { width:min(100% - 20px,1180px); margin-top:20px; } .page-heading { display:block; } .toolbar { justify-content:flex-start; margin-top:8px; } .updated { text-align:left; } .account-grid { grid-template-columns:1fr; } .account-card { padding:18px; } .meter-detail { display:block; } .meter-detail span + span { display:block; margin-top:4px; } }
 </style></head><body><main>
-  <header class="page-heading"><div><span class="eyebrow">◉ USAGE LIMITS</span><h1>Command Code 账号用量</h1></div><p class="updated">更新于 ${escapeHtml(new Date().toLocaleString('zh-CN', { hour12: false }))}</p></header>
-  <section class="account-grid" aria-label="账号额度">${accountCards}</section>
-</main></body></html>`;
+  <header class="page-heading"><div><span class="eyebrow">◉ USAGE LIMITS</span><h1>Command Code 账号用量</h1></div><div class="toolbar"><span id="syncState" class="updated">正在后台刷新…</span><button id="refreshUsage" type="button">刷新</button>${settingsLink}</div></header>
+  <section id="accounts" class="account-grid" aria-label="账号额度" aria-live="polite">${accountCards}</section>
+</main><script nonce="${escapeHtml(scriptNonce)}">
+const grid=document.getElementById('accounts'),syncState=document.getElementById('syncState'),refreshButton=document.getElementById('refreshUsage');let pollingTimer=0,inFlight=false;
+const finite=value=>typeof value==='number'&&Number.isFinite(value);
+function node(tag,className,text){const el=document.createElement(tag);if(className)el.className=className;if(text!==undefined)el.textContent=text;return el}
+function amount(value){return finite(value)?'$'+value.toFixed(2):'—'}
+function resetText(value){if(!value)return '';const date=new Date(value);return Number.isNaN(date.getTime())?'':'重置于 '+date.toLocaleString('zh-CN',{hour12:false})}
+function meter(label,windowData){if(!windowData||!finite(windowData.used)||!finite(windowData.cap)||windowData.cap<=0)return null;const percent=Math.min(100,Math.max(0,windowData.used/windowData.cap*100));const section=node('section','meter '+(percent>=90?'danger':percent>=70?'warning':'normal'));const heading=node('div','meter-heading');heading.append(node('h3','',label),node('strong','',percent.toFixed(1)+'%'));const segments=node('div','segments');segments.setAttribute('role','progressbar');segments.setAttribute('aria-label',label);segments.setAttribute('aria-valuemin','0');segments.setAttribute('aria-valuemax','100');segments.setAttribute('aria-valuenow',percent.toFixed(1));const active=Math.ceil(percent/100*24);for(let i=0;i<24;i++)segments.append(node('span','segment'+(i<active?' active':'')));const detail=node('div','meter-detail');detail.append(node('span','',amount(windowData.used)+' / '+amount(windowData.cap)),node('span','',resetText(windowData.resetAt)));section.append(heading,segments,detail);return section}
+function summary(data){if(!data||![data.totalRequests,data.totalTokens,data.inputTokens,data.outputTokens].some(finite))return null;const section=node('section','summary'),items=node('div','summary-grid');section.append(node('h3','','历史汇总'),items);const values=[['请求',data.totalRequests],['总 Token',data.totalTokens],['输入 Token',data.inputTokens],['输出 Token',data.outputTokens],['成功率',finite(data.successRate)?(data.successRate*(data.successRate<=1?100:1)).toFixed(1)+'%':null]];for(const [label,value] of values){if(value===null||value===undefined)continue;const item=node('span');item.append(node('b','',label),document.createTextNode(typeof value==='number'?new Intl.NumberFormat('zh-CN',{maximumFractionDigits:2,notation:Math.abs(value)>=10000?'compact':'standard'}).format(value):value));items.append(item)}if(data.periodBasis)section.append(node('p','','统计范围：'+data.periodBasis));return section}
+function card(account){const article=node('article','account-card'),header=node('header'),title=node('div'),pending=account.status==='loading'||account.status==='not_checked',statusText=account.status==='ok'?'已同步':pending?'加载中':'暂不可用';title.append(node('span','eyebrow','ACCOUNT'),node('h2','',account.alias||account.id),node('span','status '+(account.status==='ok'?'ok':pending?'loading':'unavailable'),statusText+' · 优先级 '+(account.priority??'-')));header.append(title);article.append(header);const monthly=account.monthly?{used:account.monthly.used,cap:account.monthly.cap,resetAt:account.monthly.resetAt}:null;let content=false;for(const [label,value] of [['5-Hour limit',account.fiveHour],['Weekly limit',account.weekly],['Monthly limit',monthly]]){const item=meter(label,value);if(item){article.append(item);content=true}}const history=summary(account.summary);if(history){article.append(history);content=true}if(!content)article.append(node('p','empty',pending?'正在读取额度…':'官方接口暂未返回可展示的额度窗口。'));return article}
+function render(data){grid.replaceChildren(...data.accounts.map(card));const date=data.fetchedAt?new Date(data.fetchedAt):new Date();syncState.textContent=data.refreshing?'正在后台刷新…':'更新于 '+date.toLocaleString('zh-CN',{hour12:false})}
+async function load(force=false){if(inFlight)return;inFlight=true;refreshButton.disabled=true;clearTimeout(pollingTimer);try{const response=await fetch('/usage?format=json&async=1'+(force?'&refresh=1':''),{credentials:'same-origin',cache:'no-store'});let data=null;try{data=await response.json()}catch{}if(!response.ok)throw new Error(data?.error?.message||'额度读取失败');render(data);if(data.refreshing)pollingTimer=setTimeout(()=>load(false),800)}catch(error){syncState.textContent=error.message;pollingTimer=setTimeout(()=>load(false),5000)}finally{inFlight=false;refreshButton.disabled=false}}
+refreshButton.addEventListener('click',()=>load(true));load(true);
+</script></body></html>`;
 }
 
 function clientWantsUsageHtml(req, url) {
@@ -2513,14 +2574,35 @@ function clientWantsUsageHtml(req, url) {
 }
 
 function sendUsageHtml(res, usages) {
+  const scriptNonce = crypto.randomBytes(18).toString('base64');
   res.writeHead(200, {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
-    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${scriptNonce}'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
     'Referrer-Policy': 'no-referrer',
     'X-Content-Type-Options': 'nosniff',
   });
-  res.end(renderUsageDashboard(usages));
+  res.end(renderUsageDashboard(usages, scriptNonce));
+}
+
+function getPoolUsageSnapshot() {
+  const pending = Boolean(poolUsageRefreshPromise);
+  return ACCOUNT_POOL.accounts.map(account => ({
+    ...(poolUsageStore.get(account.id)?.usage || { id: account.id, status: pending ? 'loading' : 'not_checked' }),
+    alias: account.alias,
+    priority: account.priority,
+  }));
+}
+
+function sendUsageJson(res) {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  sendJSON(res, 200, {
+    object: 'account_pool_usage',
+    fetchedAt: new Date().toISOString(),
+    refreshing: Boolean(poolUsageRefreshPromise),
+    accounts: getPoolUsageSnapshot(),
+  });
 }
 
 async function handleUsage(req, res, url) {
@@ -2533,49 +2615,85 @@ async function handleUsage(req, res, url) {
     return;
   }
 
-  // /usage 必须反映当前值，因此强制刷新；并发请求会共用同一轮上游查询。
-  const usages = await refreshPoolUsage(true);
-  const accounts = ACCOUNT_POOL.accounts.map(account => ({
-    ...(usages.find(usage => usage?.id === account.id) || { id: account.id, status: 'unavailable' }),
-    alias: account.alias,
-    priority: account.priority,
-  }));
   if (clientWantsUsageHtml(req, url)) {
-    sendUsageHtml(res, accounts);
+    // HTML 首屏立即返回，额度查询在后台执行并由页面轮询增量展示。
+    void refreshPoolUsage(true).catch(error => log('warn', 'Usage dashboard refresh failed', { message: error.message }));
+    sendUsageHtml(res, getPoolUsageSnapshot());
     return;
   }
-  res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  sendJSON(res, 200, {
-    object: 'account_pool_usage',
-    fetchedAt: new Date().toISOString(),
-    accounts,
-  });
+  if (url.searchParams.get('async') === '1') {
+    if (url.searchParams.get('refresh') === '1' || poolUsageStore.size === 0) {
+      void refreshPoolUsage(url.searchParams.get('refresh') === '1').catch(error => log('warn', 'Async usage refresh failed', { message: error.message }));
+    }
+    sendUsageJson(res);
+    return;
+  }
+  // 保持既有 JSON 调用语义：不带 async=1 时等待一轮完整刷新再返回。
+  await refreshPoolUsage(true);
+  sendUsageJson(res);
 }
 
 // ── 管理登录与账号池在线设置 ──────────────────────────
 // The management plane is deliberately separate from the proxy API: it has no
-// CORS, uses a signed-length random HttpOnly session cookie, requires a CSRF
+// CORS, uses a fixed-length random HttpOnly session cookie, requires a CSRF
 // token for changes, and writes only to the fixed runtime override path.
 const ADMIN_SESSION_COOKIE = 'cc_proxy_admin';
 const ADMIN_MAX_BODY_SIZE = 64 * 1024;
 const ADMIN_LOGIN_FAILURE_LIMIT = 5;
 const ADMIN_LOGIN_BLOCK_MS = 15 * 60 * 1000;
+const ADMIN_MAX_TRACKED_LOGIN_IPS = 10000;
 const adminSessionStore = new Map();
 const adminLoginAttempts = new Map();
+
+function pruneAdminLoginAttempts(now = Date.now()) {
+  for (const [ip, attempt] of adminLoginAttempts) {
+    if (attempt.lastSeen + ADMIN_LOGIN_BLOCK_MS <= now && attempt.blockedUntil <= now) adminLoginAttempts.delete(ip);
+  }
+  while (adminLoginAttempts.size >= ADMIN_MAX_TRACKED_LOGIN_IPS) {
+    let oldestIp = null;
+    let oldestSeen = Number.POSITIVE_INFINITY;
+    for (const [ip, attempt] of adminLoginAttempts) {
+      if (attempt.lastSeen < oldestSeen) {
+        oldestIp = ip;
+        oldestSeen = attempt.lastSeen;
+      }
+    }
+    if (oldestIp === null) break;
+    adminLoginAttempts.delete(oldestIp);
+  }
+}
 
 setInterval(() => {
   const now = Date.now();
   for (const [token, session] of adminSessionStore) {
     if (session.expiresAt <= now) adminSessionStore.delete(token);
   }
-  for (const [ip, attempt] of adminLoginAttempts) {
-    if (attempt.lastSeen + ADMIN_LOGIN_BLOCK_MS <= now && attempt.blockedUntil <= now) adminLoginAttempts.delete(ip);
-  }
+  pruneAdminLoginAttempts(now);
 }, 10 * 60 * 1000);
 
 function isAdminRequestAllowed(req) {
   return ADMIN_AUTH.enabled && (ADMIN_AUTH.allowedIps.includes('*') || ADMIN_AUTH.allowedIps.includes(getRemoteAddress(req)));
+}
+
+function isSecureAdminRequest(req) {
+  if (req.socket?.encrypted === true) return true;
+  const peer = getRemoteAddress(req);
+  if (!ADMIN_AUTH.trustedProxyIps?.includes(peer)) return false;
+  const forwardedProto = typeof req.headers['x-forwarded-proto'] === 'string'
+    ? req.headers['x-forwarded-proto'].split(',')[0].trim().toLowerCase()
+    : '';
+  return forwardedProto === 'https';
+}
+
+function getAdminLoginAddress(req) {
+  const peer = getRemoteAddress(req);
+  if (!ADMIN_AUTH.trustedProxyIps?.includes(peer)) return peer;
+  const forwardedFor = typeof req.headers['x-forwarded-for'] === 'string' ? req.headers['x-forwarded-for'] : '';
+  // A trusted edge must overwrite X-Forwarded-For or append the real client as
+  // the last value. Client-controlled values earlier in the chain are ignored.
+  const candidate = forwardedFor.split(',').at(-1)?.trim() || '';
+  if (isIP(candidate) === 0) return peer;
+  return candidate.startsWith('::ffff:') ? candidate.slice(7) : candidate;
 }
 
 function parseRequestCookies(req) {
@@ -2610,6 +2728,7 @@ function getLoginAttempt(ip) {
   const now = Date.now();
   const attempt = adminLoginAttempts.get(ip);
   if (!attempt || now - attempt.lastSeen > ADMIN_LOGIN_BLOCK_MS) {
+    if (!attempt) pruneAdminLoginAttempts(now);
     const fresh = { failures: 0, blockedUntil: 0, lastSeen: now };
     adminLoginAttempts.set(ip, fresh);
     return fresh;
@@ -2625,14 +2744,13 @@ function recordFailedAdminLogin(ip) {
     attempt.blockedUntil = Date.now() + ADMIN_LOGIN_BLOCK_MS;
     attempt.failures = 0;
   }
-  if (adminLoginAttempts.size > 10000) adminLoginAttempts.clear();
 }
 
 function getAdminSession(req) {
   const token = parseRequestCookies(req).get(ADMIN_SESSION_COOKIE);
   if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
   const session = adminSessionStore.get(token);
-  if (!session || session.expiresAt <= Date.now() || session.ip !== getRemoteAddress(req)) {
+  if (!session || session.expiresAt <= Date.now()) {
     if (session) adminSessionStore.delete(token);
     return null;
   }
@@ -2642,7 +2760,7 @@ function getAdminSession(req) {
 function setAdminSessionCookie(res, token, maxAgeSeconds) {
   const attributes = [
     `${ADMIN_SESSION_COOKIE}=${token}`,
-    'Path=/',
+    'Path=/api/admin',
     'HttpOnly',
     'SameSite=Strict',
     `Max-Age=${maxAgeSeconds}`,
@@ -2652,7 +2770,7 @@ function setAdminSessionCookie(res, token, maxAgeSeconds) {
 }
 
 function clearAdminSessionCookie(res) {
-  const attributes = [`${ADMIN_SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Strict', 'Max-Age=0'];
+  const attributes = [`${ADMIN_SESSION_COOKIE}=`, 'Path=/api/admin', 'HttpOnly', 'SameSite=Strict', 'Max-Age=0'];
   if (ADMIN_AUTH.secureCookie) attributes.push('Secure');
   res.setHeader('Set-Cookie', attributes.join('; '));
 }
@@ -2761,6 +2879,7 @@ function persistAccountPoolOverride(accountPool) {
 
 function applyAccountPoolSettings(accountPool) {
   const nextPool = normalizeAccountPool(accountPool);
+  poolUsageGeneration += 1;
   CFG.accountPool = accountPool;
   ACCOUNT_POOL = nextPool;
   poolUsageStore.clear();
@@ -2777,9 +2896,19 @@ async function handleAdminLogin(req, res) {
     sendJSON(res, 404, { error: { message: 'Admin settings are not enabled', type: 'not_found' } });
     return;
   }
-  const ip = getRemoteAddress(req);
+  const ip = getAdminLoginAddress(req);
   if (!isAdminRequestAllowed(req)) {
     sendJSON(res, 403, { error: { message: 'Admin settings are restricted to configured source IPs', type: 'access_denied' } });
+    return;
+  }
+  if (ADMIN_AUTH.secureCookie && !isSecureAdminRequest(req)) {
+    log('warn', 'Rejected insecure admin login', { ip });
+    sendJSON(res, 426, {
+      error: {
+        message: '管理登录必须使用 HTTPS。若 TLS 在反向代理终止，请将该代理的后端 IP 加入 adminAuth.trustedProxyIps。',
+        type: 'https_required',
+      },
+    });
     return;
   }
   const attempt = getLoginAttempt(ip);
@@ -2836,7 +2965,7 @@ function handleAdminLogout(req, res) {
   sendJSON(res, 204, null);
 }
 
-function renderAdminPage() {
+function renderAdminPage(scriptNonce) {
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>账号池设置</title><style>
@@ -2845,35 +2974,49 @@ function renderAdminPage() {
 <header class="row space"><div><p class="muted">ADMIN SETTINGS</p><h1>账号池设置</h1></div><a class="muted" href="/usage">返回用量</a></header>
 <section id="login" class="panel"><h2>登录</h2><form id="loginForm" class="row" style="margin-top:14px"><label style="min-width:min(320px,100%)">管理密码<input id="password" type="password" autocomplete="current-password" required></label><button>登录</button></form></section>
 <section id="settings" class="panel hidden"><div class="row space"><h2>在线配置</h2><button id="logout" class="secondary">退出</button></div><p class="muted" style="margin:10px 0 18px">留空的账号 Key 与专属代理 Key 会保留原值；保存后立即在内存重载，并持久化到 Docker 数据卷。</p><div class="row"><label><span>账号池</span><select id="poolEnabled"><option value="true">启用</option><option value="false">停用</option></select></label><label><span>选择策略</span><select id="strategy"><option value="priority">按优先级</option><option value="earliest_monthly_reset">月度重置时间优先</option><option value="round_robin">轮询</option></select></label><label><span>额度刷新间隔（毫秒）</span><input id="refresh" type="number" min="15000" max="900000"></label><label style="min-width:280px"><span>替换专属代理 Key（可选）</span><input id="proxyKey" type="password" autocomplete="new-password" placeholder="留空保留当前值"></label></div><div id="accounts" style="margin-top:18px"></div><div class="row" style="margin-top:16px"><button id="add" type="button" class="secondary">添加账号</button><button id="save" type="button">保存并重载</button></div></section><p id="message" role="status"></p>
-</main><script>
+</main><script nonce="${escapeHtml(scriptNonce)}">
 let state=null;let csrf='';const $=id=>document.getElementById(id);const message=(text,error=false)=>{const el=$('message');el.textContent=text;el.className=error?'error':''};
-async function api(path,options={}){const response=await fetch(path,{credentials:'same-origin',headers:{'Content-Type':'application/json',...(options.headers||{})},...options});let data=null;try{data=await response.json()}catch{}if(!response.ok)throw new Error(data?.error?.message||'请求失败');return data}
+async function api(path,options={}){const {headers={},...rest}=options;const response=await fetch(path,{...rest,credentials:'same-origin',headers:{'Content-Type':'application/json',...headers}});let data=null;try{data=await response.json()}catch{}if(!response.ok){const error=new Error(data?.error?.message||'请求失败');error.status=response.status;throw error}return data}
 function row(account={id:'',alias:'',priority:1,enabled:true,hasApiKey:false,status:'new'}){const el=document.createElement('div');el.className='account';for(const [name,label,type,value] of [['id','ID','text',account.id],['alias','别名','text',account.alias],['priority','优先级','number',account.priority]]){const wrap=document.createElement('label');wrap.textContent=label;const input=document.createElement('input');input.dataset.field=name;input.type=type;input.value=value;input.required=true;if(name==='priority'){input.min='1';input.max='1000'}wrap.append(input);el.append(wrap)}const enabled=document.createElement('label');enabled.textContent='状态';const select=document.createElement('select');select.dataset.field='enabled';select.innerHTML='<option value="true">启用</option><option value="false">停用</option>';select.value=String(account.enabled);enabled.append(select);el.append(enabled);const key=document.createElement('label');key.textContent=account.hasApiKey?'替换 Key（留空保留）':'Command Code Key';const keyInput=document.createElement('input');keyInput.dataset.field='apiKey';keyInput.type='password';keyInput.autocomplete='new-password';keyInput.placeholder=account.hasApiKey?'留空保留现有 Key':'user_…';key.append(keyInput);el.append(key);const remove=document.createElement('button');remove.type='button';remove.className='secondary danger';remove.textContent='移除';remove.onclick=()=>el.remove();el.append(remove);return el}
 function render(next){state=next;csrf=next.csrfToken;$('poolEnabled').value=String(next.accountPool.enabled);$('strategy').value=next.accountPool.selectionStrategy;$('refresh').value=next.accountPool.usageRefreshIntervalMs;const target=$('accounts');target.replaceChildren(...next.accountPool.accounts.map(row));$('login').classList.add('hidden');$('settings').classList.remove('hidden')}
-$('loginForm').addEventListener('submit',async event=>{event.preventDefault();try{render(await api('/api/admin/login',{method:'POST',body:JSON.stringify({password:$('password').value})}));$('password').value='';message('登录成功')}catch(error){message(error.message,true)}});
-$('add').onclick=()=>$('accounts').append(row({priority:$('accounts').children.length+1}));$('save').onclick=async()=>{try{const accounts=[...$('accounts').children].map(el=>({id:el.querySelector('[data-field=id]').value.trim(),alias:el.querySelector('[data-field=alias]').value.trim(),priority:Number(el.querySelector('[data-field=priority]').value),enabled:el.querySelector('[data-field=enabled]').value==='true',apiKey:el.querySelector('[data-field=apiKey]').value.trim()}));render(await api('/api/admin/account-pool',{method:'PUT',headers:{'X-CSRF-Token':csrf},body:JSON.stringify({enabled:$('poolEnabled').value==='true',selectionStrategy:$('strategy').value,usageRefreshIntervalMs:Number($('refresh').value),proxyKey:$('proxyKey').value,accounts})}));$('proxyKey').value='';message('已保存并立即重载')}catch(error){message(error.message,true)}};
-$('logout').onclick=async()=>{try{await api('/api/admin/logout',{method:'POST',headers:{'X-CSRF-Token':csrf}});}catch{}state=null;csrf='';$('settings').classList.add('hidden');$('login').classList.remove('hidden');message('已退出')};
+function showLogin(){state=null;csrf='';$('settings').classList.add('hidden');$('login').classList.remove('hidden')}
+$('loginForm').addEventListener('submit',async event=>{event.preventDefault();const loopback=['localhost','127.0.0.1','::1','[::1]'].includes(location.hostname);if(location.protocol!=='https:'&&!loopback){message('管理登录必须使用 HTTPS；请先配置 HTTPS 反向代理。',true);return}const button=event.submitter;button.disabled=true;try{await api('/api/admin/login',{method:'POST',body:JSON.stringify({password:$('password').value})});render(await api('/api/admin/state'));$('password').value='';message('登录成功')}catch(error){showLogin();message(error.message,true)}finally{button.disabled=false}});
+$('add').onclick=()=>$('accounts').append(row({priority:$('accounts').children.length+1}));$('save').onclick=async()=>{const button=$('save');button.disabled=true;try{const accounts=[...$('accounts').children].map(el=>({id:el.querySelector('[data-field=id]').value.trim(),alias:el.querySelector('[data-field=alias]').value.trim(),priority:Number(el.querySelector('[data-field=priority]').value),enabled:el.querySelector('[data-field=enabled]').value==='true',apiKey:el.querySelector('[data-field=apiKey]').value.trim()}));render(await api('/api/admin/account-pool',{method:'PUT',headers:{'X-CSRF-Token':csrf},body:JSON.stringify({enabled:$('poolEnabled').value==='true',selectionStrategy:$('strategy').value,usageRefreshIntervalMs:Number($('refresh').value),proxyKey:$('proxyKey').value,accounts})}));$('proxyKey').value='';message('已保存并立即重载')}catch(error){if(error.status===401)showLogin();message(error.status===401?'登录状态已失效，请重新登录':error.message,true)}finally{button.disabled=false}};
+$('logout').onclick=async()=>{try{await api('/api/admin/logout',{method:'POST',headers:{'X-CSRF-Token':csrf}});}catch{}showLogin();message('已退出')};
+api('/api/admin/state').then(render).catch(()=>showLogin());
 </script></body></html>`;
 }
 
 function sendAdminPage(res) {
+  const scriptNonce = crypto.randomBytes(18).toString('base64');
   res.writeHead(200, {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
-    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${scriptNonce}'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
     'Referrer-Policy': 'no-referrer',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
   });
-  res.end(renderAdminPage());
+  res.end(renderAdminPage(scriptNonce));
 }
 
 // ── 服务器 ──────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
-  const host = req.headers.host || 'localhost';
-  const url = new URL(req.url, `http://${host}`);
-  const privateRoute = url.pathname === '/usage' || url.pathname === '/admin' || url.pathname.startsWith('/api/admin/');
+  let url;
+  try {
+    // Routing never depends on the untrusted Host header.
+    url = new URL(req.url || '/', 'http://localhost');
+  } catch {
+    sendJSON(res, 400, { error: { message: 'Invalid request target', type: 'invalid_request_error' } });
+    return;
+  }
+  const adminApiRoute = url.pathname.startsWith('/api/admin/');
+  const privateRoute = url.pathname === '/usage' || url.pathname === '/admin' || adminApiRoute;
+  if (adminApiRoute) {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+  }
   if (!privateRoute) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');

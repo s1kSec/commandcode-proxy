@@ -10,7 +10,8 @@
   "adminAuth": {
     "enabled": false,
     "passwordHash": "",
-    "allowedIps": ["127.0.0.1", "::1"],
+    "allowedIps": ["*"],
+    "trustedProxyIps": [],
     "sessionTtlMinutes": 120,
     "secureCookie": true
   },
