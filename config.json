@@ -13,7 +13,7 @@
     "allowedIps": ["*"],
     "trustedProxyIps": [],
     "sessionTtlMinutes": 120,
-    "secureCookie": true
+    "secureCookie": false
   },
   "accountPool": {
     "enabled": false,

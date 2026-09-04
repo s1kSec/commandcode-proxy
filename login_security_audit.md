@@ -8,12 +8,12 @@
 - 范围外：OpenAI/Anthropic 协议转换、SSE 内容语义、Command Code 官方服务本身及公网基础设施渗透测试。
 - 原始问题实例：4 个低风险防御缺口，均已修复；未确认任何身份认证或权限绕过。
 - 去重根因：4 个。
-- 最高风险结论：当前代码未发现可在不知道管理密码的情况下读取管理状态或修改账号池的路径。公网部署仍必须使用 HTTPS、强密码哈希，并正确配置可信反向代理。
+- 最高风险结论：当前代码未发现可在不知道管理密码的情况下读取管理状态或修改账号池的路径。当前部署按业务要求允许公网 HTTP，这会暴露密码和会话给能够监听链路的攻击者，属于明确接受的传输安全风险。
 
 ## 2) 攻击面清单
 
 - HTTP/API：1 个公开登录页面、1 个登录接口、1 个只读状态接口、1 个配置写接口、1 个退出接口。
-- 身份与权限：单管理员角色；scrypt 密码校验；随机服务端会话；HttpOnly、SameSite=Strict、Secure Cookie；写操作要求独立 CSRF Token。
+- 身份与权限：单管理员角色；scrypt 密码校验；随机服务端会话；HttpOnly、SameSite=Strict Cookie；`secureCookie: true` 时额外使用 Secure；写操作要求独立 CSRF Token。
 - 文件写入：只有通过认证和 CSRF 校验的账号池设置可写入固定的 `data/account-pool.override.json`；请求不能控制路径。
 - 外部边界：TLS 终止代理只有在直连地址精确命中 `trustedProxyIps` 时，其 `X-Forwarded-Proto` 和最终 `X-Forwarded-For` 才被信任。
 - 敏感数据：管理状态只返回 `hasApiKey`，不返回账号 Key、账号池代理 Key、密码哈希或邮箱。
@@ -74,7 +74,7 @@
 ## 5) 修复优先级
 
 - P0：无未修复项。
-- P1：上线前启用 HTTPS；使用强随机管理密码生成有效 scrypt 哈希；仅填写真实后端代理 IP 到 `trustedProxyIps`；反向代理必须覆盖相应转发头。
+- P1：使用强随机管理密码生成有效 scrypt 哈希；如果以后启用 HTTPS，则恢复 `secureCookie: true`，仅填写真实后端代理 IP 到 `trustedProxyIps`，并让反向代理覆盖相应转发头。
 - P2：在公网入口增加独立的连接/请求速率限制与告警；定期重启或主动注销以失效旧的内存会话。
 
 ## 6) 回归结果
@@ -93,4 +93,5 @@
 
 - 本报告验证的是当前工作区代码和本地 mock 上游；没有对生产 Nginx/Caddy、云防火墙或 Command Code 官方服务做入侵测试。
 - `allowedIps: ["*"]` 是明确的业务选择，只代表任何来源可以到达登录入口，不代表任何来源通过了认证。
+- `secureCookie: false` 是本次按业务要求接受的风险：公网 HTTP 上的密码和会话 Cookie 可以被同链路监听者读取或篡改，应用层鉴权无法消除此风险。
 - 仓库示例配置中的 `adminAuth.enabled` 仍为 `false`，且没有默认密码。必须由部署者设置有效密码哈希后才能启用；这是故意的 fail-closed 行为。

@@ -249,6 +249,41 @@ test('secure admin cookie refuses an untrusted plain HTTP login', async t => {
   assert.equal((await response.json()).error.type, 'https_required');
 });
 
+test('public HTTP admin login works when secureCookie is explicitly disabled', async t => {
+  const port = await freePort();
+  const password = 'test-password-only';
+  const proxy = await startProxy({
+    port,
+    host: '127.0.0.1',
+    apiBase: 'http://127.0.0.1:1',
+    usageAllowedIps: ['*'],
+    adminAuth: {
+      enabled: true,
+      passwordHash: passwordHash(password),
+      allowedIps: ['*'],
+      trustedProxyIps: [],
+      sessionTtlMinutes: 30,
+      secureCookie: false,
+    },
+    accountPool: { enabled: false },
+  });
+  t.after(() => proxy.close());
+
+  const loginResponse = await fetch(`${proxy.baseUrl}/api/admin/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
+  });
+  assert.equal(loginResponse.status, 200);
+  const setCookie = loginResponse.headers.get('set-cookie');
+  assert.match(setCookie, /Path=\/api\/admin; HttpOnly; SameSite=Strict/);
+  assert.doesNotMatch(setCookie, /; Secure(?:;|$)/);
+
+  const cookie = setCookie.split(';', 1)[0];
+  const stateResponse = await fetch(`${proxy.baseUrl}/api/admin/state`, { headers: { Cookie: cookie } });
+  assert.equal(stateResponse.status, 200);
+});
+
 test('secure admin cookie accepts HTTPS metadata from an exact trusted proxy', async t => {
   const port = await freePort();
   const password = 'test-password-only';
