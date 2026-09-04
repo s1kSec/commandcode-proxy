@@ -222,8 +222,9 @@ test('usage dashboard loads immediately and admin session survives the login res
   assert.doesNotMatch(JSON.stringify(savedState), /user_test_key|test-proxy-key/);
 });
 
-test('secure admin cookie refuses an untrusted plain HTTP login', async t => {
+test('legacy secureCookie true cannot re-enable the removed HTTPS-only login gate', async t => {
   const port = await freePort();
+  const password = 'test-password-only';
   const proxy = await startProxy({
     port,
     host: '127.0.0.1',
@@ -231,8 +232,8 @@ test('secure admin cookie refuses an untrusted plain HTTP login', async t => {
     usageAllowedIps: ['127.0.0.1'],
     adminAuth: {
       enabled: true,
-      passwordHash: passwordHash('test-password-only'),
-      allowedIps: ['127.0.0.1'],
+      passwordHash: passwordHash(password),
+      allowedIps: ['*'],
       trustedProxyIps: [],
       sessionTtlMinutes: 30,
       secureCookie: true,
@@ -242,11 +243,11 @@ test('secure admin cookie refuses an untrusted plain HTTP login', async t => {
   t.after(() => proxy.close());
   const response = await fetch(`${proxy.baseUrl}/api/admin/login`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Forwarded-Proto': 'https' },
-    body: JSON.stringify({ password: 'test-password-only' }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
   });
-  assert.equal(response.status, 426);
-  assert.equal((await response.json()).error.type, 'https_required');
+  assert.equal(response.status, 200);
+  assert.doesNotMatch(response.headers.get('set-cookie'), /; Secure(?:;|$)/);
 });
 
 test('public HTTP admin login works when secureCookie is explicitly disabled', async t => {
@@ -284,7 +285,7 @@ test('public HTTP admin login works when secureCookie is explicitly disabled', a
   assert.equal(stateResponse.status, 200);
 });
 
-test('secure admin cookie accepts HTTPS metadata from an exact trusted proxy', async t => {
+test('trusted proxy metadata does not change the HTTP-compatible admin cookie', async t => {
   const port = await freePort();
   const password = 'test-password-only';
   const proxy = await startProxy({
@@ -309,7 +310,7 @@ test('secure admin cookie accepts HTTPS metadata from an exact trusted proxy', a
     body: JSON.stringify({ password }),
   });
   assert.equal(response.status, 200);
-  assert.match(response.headers.get('set-cookie'), /; Secure$/);
+  assert.doesNotMatch(response.headers.get('set-cookie'), /; Secure(?:;|$)/);
 });
 
 test('forwarded client IP cannot bypass the direct-peer admin allowlist', async t => {

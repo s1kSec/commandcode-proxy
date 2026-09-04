@@ -13,9 +13,9 @@
 ## 2) 攻击面清单
 
 - HTTP/API：1 个公开登录页面、1 个登录接口、1 个只读状态接口、1 个配置写接口、1 个退出接口。
-- 身份与权限：单管理员角色；scrypt 密码校验；随机服务端会话；HttpOnly、SameSite=Strict Cookie；`secureCookie: true` 时额外使用 Secure；写操作要求独立 CSRF Token。
+- 身份与权限：单管理员角色；scrypt 密码校验；随机服务端会话；HttpOnly、SameSite=Strict Cookie；按业务要求不设置 Secure；写操作要求独立 CSRF Token。
 - 文件写入：只有通过认证和 CSRF 校验的账号池设置可写入固定的 `data/account-pool.override.json`；请求不能控制路径。
-- 外部边界：TLS 终止代理只有在直连地址精确命中 `trustedProxyIps` 时，其 `X-Forwarded-Proto` 和最终 `X-Forwarded-For` 才被信任。
+- 外部边界：只有在直连地址精确命中 `trustedProxyIps` 时，最终 `X-Forwarded-For` 才用于登录限流身份；它不参与权限判定。
 - 敏感数据：管理状态只返回 `hasApiKey`，不返回账号 Key、账号池代理 Key、密码哈希或邮箱。
 
 ## 3) 发现与修复
@@ -74,7 +74,7 @@
 ## 5) 修复优先级
 
 - P0：无未修复项。
-- P1：使用强随机管理密码生成有效 scrypt 哈希；如果以后启用 HTTPS，则恢复 `secureCookie: true`，仅填写真实后端代理 IP 到 `trustedProxyIps`，并让反向代理覆盖相应转发头。
+- P1：使用强随机管理密码生成有效 scrypt 哈希；如果以后改回 HTTPS，应重新引入 Secure Cookie；仅填写真实后端代理 IP 到 `trustedProxyIps`，并让反向代理覆盖相应转发头。
 - P2：在公网入口增加独立的连接/请求速率限制与告警；定期重启或主动注销以失效旧的内存会话。
 
 ## 6) 回归结果
@@ -82,7 +82,7 @@
 - 管理状态无 Cookie：401。
 - 随机 Cookie + 正确账号池代理 Key：401。
 - 错误/缺失 CSRF 写配置：403。
-- 未受信来源伪造 `X-Forwarded-Proto`：426。
+- 即使旧配置保留 `secureCookie: true`，公网 HTTP 登录仍可建立并保持会话：通过。
 - 伪造 `X-Forwarded-For` 绕过来源白名单：403。
 - 尾斜杠和编码路径变体：404。
 - 受信代理后的客户端限流隔离：通过。

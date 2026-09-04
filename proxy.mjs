@@ -57,7 +57,7 @@ function loadConfig() {
       allowedIps: ['127.0.0.1', '::1'],
       trustedProxyIps: [],
       sessionTtlMinutes: 120,
-      secureCookie: true,
+      secureCookie: false,
     },
     accountPool: {
       enabled: false,
@@ -166,16 +166,15 @@ function normalizeAdminAuth(rawAuth) {
   if (!Number.isInteger(sessionTtlMinutes) || sessionTtlMinutes < 5 || sessionTtlMinutes > 720) {
     throw new Error('adminAuth.sessionTtlMinutes must be an integer from 5 to 720');
   }
-  if (rawAuth.secureCookie !== undefined && typeof rawAuth.secureCookie !== 'boolean') {
-    throw new Error('adminAuth.secureCookie must be a boolean');
-  }
   return {
     enabled: true,
     passwordHash: rawAuth.passwordHash,
     allowedIps: rawAuth.allowedIps,
     trustedProxyIps,
     sessionTtlMs: sessionTtlMinutes * 60 * 1000,
-    secureCookie: rawAuth.secureCookie !== false,
+    // HTTP-by-IP compatibility mode: legacy secureCookie values are ignored so
+    // an old mounted config cannot re-enable the removed HTTPS-only gate.
+    secureCookie: false,
   };
 }
 
@@ -2671,16 +2670,6 @@ function isAdminRequestAllowed(req) {
   return ADMIN_AUTH.enabled && (ADMIN_AUTH.allowedIps.includes('*') || ADMIN_AUTH.allowedIps.includes(getRemoteAddress(req)));
 }
 
-function isSecureAdminRequest(req) {
-  if (req.socket?.encrypted === true) return true;
-  const peer = getRemoteAddress(req);
-  if (!ADMIN_AUTH.trustedProxyIps?.includes(peer)) return false;
-  const forwardedProto = typeof req.headers['x-forwarded-proto'] === 'string'
-    ? req.headers['x-forwarded-proto'].split(',')[0].trim().toLowerCase()
-    : '';
-  return forwardedProto === 'https';
-}
-
 function getAdminLoginAddress(req) {
   const peer = getRemoteAddress(req);
   if (!ADMIN_AUTH.trustedProxyIps?.includes(peer)) return peer;
@@ -2761,13 +2750,11 @@ function setAdminSessionCookie(res, token, maxAgeSeconds) {
     'SameSite=Strict',
     `Max-Age=${maxAgeSeconds}`,
   ];
-  if (ADMIN_AUTH.secureCookie) attributes.push('Secure');
   res.setHeader('Set-Cookie', attributes.join('; '));
 }
 
 function clearAdminSessionCookie(res) {
   const attributes = [`${ADMIN_SESSION_COOKIE}=`, 'Path=/api/admin', 'HttpOnly', 'SameSite=Strict', 'Max-Age=0'];
-  if (ADMIN_AUTH.secureCookie) attributes.push('Secure');
   res.setHeader('Set-Cookie', attributes.join('; '));
 }
 
@@ -2895,16 +2882,6 @@ async function handleAdminLogin(req, res) {
   const ip = getAdminLoginAddress(req);
   if (!isAdminRequestAllowed(req)) {
     sendJSON(res, 403, { error: { message: 'Admin settings are restricted to configured source IPs', type: 'access_denied' } });
-    return;
-  }
-  if (ADMIN_AUTH.secureCookie && !isSecureAdminRequest(req)) {
-    log('warn', 'Rejected insecure admin login', { ip });
-    sendJSON(res, 426, {
-      error: {
-        message: '管理登录必须使用 HTTPS。若 TLS 在反向代理终止，请将该代理的后端 IP 加入 adminAuth.trustedProxyIps。',
-        type: 'https_required',
-      },
-    });
     return;
   }
   const attempt = getLoginAttempt(ip);
