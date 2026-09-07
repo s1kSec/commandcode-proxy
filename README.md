@@ -6,7 +6,7 @@ A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible 
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
-**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+**Features**: OpenAI Responses API (Codex CLI 0.153+) + Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (including Responses namespaces/custom tools) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
@@ -73,6 +73,25 @@ commandcode/
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 
 ## API Endpoints
+
+### `POST /v1/responses`
+
+OpenAI Responses-compatible endpoint intended for Codex CLI 0.153 and newer. It accepts string or item-array `input`, developer/system/user/assistant messages, reasoning summaries, function calls, Codex `additional_tools` namespaces, custom grammar tools, tool outputs, images, and both SSE and buffered responses. The adapter is stateless: Codex's normal `store = false` full-input flow is supported; `store = true`, `previous_response_id`, `conversation`, background mode, item references, file inputs, and OpenAI-hosted tools are rejected with a clear `400` because Command Code has no equivalent server-side state or hosted-tool runtime.
+
+Codex configuration (`~/.codex/config.toml`):
+
+```toml
+model = "gpt-5.6-luna"
+model_provider = "commandcode_proxy"
+
+[model_providers.commandcode_proxy]
+name = "Command Code Proxy"
+base_url = "http://YOUR_PROXY_IP:33000/v1"
+env_key = "COMMANDCODE_PROXY_KEY"
+wire_api = "responses"
+```
+
+Set `COMMANDCODE_PROXY_KEY` to the configured account-pool `proxyKey` (recommended) or to a Command Code `user_...` key before starting Codex. Do not put the secret directly in `config.toml`.
 
 ### `POST /v1/chat/completions`
 

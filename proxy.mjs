@@ -916,6 +916,213 @@ function getEnvironment() {
 
 // ── CC 请求体构建 ─────────────────────────────────
 
+function invalidResponsesRequest(message) {
+  const error = new Error(message);
+  error.type = 'invalid_request_error';
+  return error;
+}
+
+function responsePartToChatPart(part) {
+  if (typeof part === 'string') return { type: 'text', text: part };
+  if (!part || typeof part !== 'object') return null;
+  if (part.type === 'input_text' || part.type === 'output_text' || part.type === 'text') {
+    return { type: 'text', text: typeof part.text === 'string' ? part.text : '' };
+  }
+  if (part.type === 'input_image' || part.type === 'image_url') {
+    const url = typeof part.image_url === 'string' ? part.image_url : part.image_url?.url;
+    if (!url) throw invalidResponsesRequest('input_image requires image_url; file_id inputs are not supported');
+    return { type: 'image_url', image_url: { url } };
+  }
+  if (part.type === 'input_file') {
+    throw invalidResponsesRequest('input_file is not supported by the Command Code upstream');
+  }
+  return null;
+}
+
+function responseOutputToText(output) {
+  if (typeof output === 'string') return output;
+  if (output === null || output === undefined) return '';
+  if (Array.isArray(output)) {
+    return output.map(part => {
+      if (typeof part === 'string') return part;
+      if (typeof part?.text === 'string') return part.text;
+      return JSON.stringify(part);
+    }).join('\n');
+  }
+  return JSON.stringify(output);
+}
+
+function sanitizeCcToolName(value) {
+  const normalized = String(value || 'tool').replace(/[^A-Za-z0-9_-]/g, '_').replace(/^_+|_+$/g, '') || 'tool';
+  return normalized.slice(0, 64);
+}
+
+function collectResponsesTools(responsesReq) {
+  const registry = new Map();
+  const lookup = new Map();
+  const chatTools = [];
+  const usedNames = new Set();
+
+  const addTool = (tool, namespace = null) => {
+    if (!tool || typeof tool !== 'object') return;
+    if (tool.type === 'namespace') {
+      if (!Array.isArray(tool.tools)) throw invalidResponsesRequest('namespace tools must be an array');
+      for (const nested of tool.tools) addTool(nested, tool.name || namespace);
+      return;
+    }
+    if (tool.type !== 'function' && tool.type !== 'custom') {
+      throw invalidResponsesRequest(`Unsupported Responses tool type: ${String(tool.type || 'unknown')}`);
+    }
+    if (typeof tool.name !== 'string' || !tool.name) throw invalidResponsesRequest('Each Responses tool requires a name');
+
+    const qualifiedName = namespace ? `${namespace}.${tool.name}` : tool.name;
+    let ccName = sanitizeCcToolName(namespace ? `${namespace}__${tool.name}` : tool.name);
+    if (usedNames.has(ccName)) {
+      const suffix = crypto.createHash('sha256').update(qualifiedName).digest('hex').slice(0, 8);
+      ccName = `${ccName.slice(0, 55)}_${suffix}`;
+    }
+    if (usedNames.has(ccName)) throw invalidResponsesRequest(`Duplicate Responses tool name: ${qualifiedName}`);
+    usedNames.add(ccName);
+
+    const meta = { type: tool.type, name: tool.name, namespace, qualifiedName, ccName };
+    registry.set(ccName, meta);
+    lookup.set(qualifiedName, meta);
+    if (!lookup.has(tool.name)) lookup.set(tool.name, meta);
+
+    if (tool.type === 'custom') {
+      chatTools.push({
+        // Command Code's generate endpoint accepts JSON-schema function tools.
+        // Adapt Responses free-form custom tools to one string argument, then
+        // restore custom_tool_call on the downstream Responses stream.
+        type: 'function',
+        function: {
+          name: ccName,
+          description: `${tool.description || ''}${tool.description ? '\n' : ''}Return the custom tool input as the string property "input". Original tool: ${qualifiedName}`,
+          parameters: {
+            type: 'object',
+            properties: { input: { type: 'string', description: 'Raw custom-tool input matching the requested format.' } },
+            required: ['input'],
+            additionalProperties: false,
+          },
+        },
+      });
+    } else {
+      chatTools.push({
+        type: 'function',
+        function: {
+          name: ccName,
+          description: tool.description || '',
+          parameters: tool.parameters || { type: 'object', properties: {} },
+          ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
+        },
+      });
+    }
+  };
+
+  if (responsesReq.tools !== undefined && !Array.isArray(responsesReq.tools)) {
+    throw invalidResponsesRequest('tools must be an array');
+  }
+  for (const tool of responsesReq.tools || []) addTool(tool);
+  for (const item of Array.isArray(responsesReq.input) ? responsesReq.input : []) {
+    if (item?.type !== 'additional_tools') continue;
+    if (!Array.isArray(item.tools)) throw invalidResponsesRequest('additional_tools.tools must be an array');
+    for (const tool of item.tools) addTool(tool);
+  }
+  if (chatTools.length > 256) throw invalidResponsesRequest('Too many tools (maximum 256)');
+  return { registry, lookup, chatTools };
+}
+
+function convertResponsesRequest(responsesReq) {
+  if (!responsesReq || typeof responsesReq !== 'object' || Array.isArray(responsesReq)) {
+    throw invalidResponsesRequest('Request body must be a JSON object');
+  }
+  if (responsesReq.previous_response_id) {
+    throw invalidResponsesRequest('previous_response_id is not supported; send the full conversation in input with store=false');
+  }
+  if (responsesReq.conversation) throw invalidResponsesRequest('conversation state is not supported');
+  if (responsesReq.background === true) throw invalidResponsesRequest('background responses are not supported');
+  if (responsesReq.store === true) throw invalidResponsesRequest('store=true is not supported; this proxy is stateless');
+  if (typeof responsesReq.model !== 'string' || !responsesReq.model) throw invalidResponsesRequest('model is required');
+
+  const toolState = collectResponsesTools(responsesReq);
+  const messages = [];
+  if (typeof responsesReq.instructions === 'string' && responsesReq.instructions) {
+    messages.push({ role: 'system', content: responsesReq.instructions });
+  }
+
+  const input = typeof responsesReq.input === 'string'
+    ? [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: responsesReq.input }] }]
+    : responsesReq.input;
+  if (!Array.isArray(input)) throw invalidResponsesRequest('input must be a string or an array');
+
+  for (const item of input) {
+    if (!item || typeof item !== 'object') throw invalidResponsesRequest('input items must be objects');
+    if (item.type === 'additional_tools') continue;
+    if (item.type === 'reasoning') {
+      const summary = Array.isArray(item.summary)
+        ? item.summary.map(part => typeof part?.text === 'string' ? part.text : '').filter(Boolean).join('\n')
+        : '';
+      if (summary) messages.push({ role: 'assistant', content: summary });
+      continue;
+    }
+    if (item.type === 'item_reference') {
+      throw invalidResponsesRequest('item_reference is not supported; send the referenced item inline');
+    }
+    if (item.type === 'message' || item.type === 'input_message' || (!item.type && item.role)) {
+      const role = item.role === 'developer' ? 'system' : item.role;
+      if (!['system', 'user', 'assistant'].includes(role)) throw invalidResponsesRequest(`Unsupported message role: ${String(item.role)}`);
+      const rawParts = typeof item.content === 'string' ? [item.content] : item.content;
+      if (!Array.isArray(rawParts)) throw invalidResponsesRequest('message content must be a string or an array');
+      const parts = rawParts.map(responsePartToChatPart).filter(Boolean);
+      const hasImage = parts.some(part => part.type === 'image_url');
+      messages.push({ role, content: hasImage ? parts : parts.map(part => part.text).join('') });
+      continue;
+    }
+    if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+      const meta = toolState.lookup.get(item.namespace ? `${item.namespace}.${item.name}` : item.name);
+      const callId = item.call_id || item.id;
+      if (!callId || typeof item.name !== 'string') throw invalidResponsesRequest(`${item.type} requires call_id and name`);
+      const args = item.type === 'custom_tool_call'
+        ? JSON.stringify({ input: typeof item.input === 'string' ? item.input : responseOutputToText(item.input) })
+        : (typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments || {}));
+      messages.push({
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: callId, type: 'function', function: { name: meta?.ccName || sanitizeCcToolName(item.name), arguments: args } }],
+      });
+      continue;
+    }
+    if (item.type === 'function_call_output' || item.type === 'custom_tool_call_output') {
+      if (!item.call_id) throw invalidResponsesRequest(`${item.type} requires call_id`);
+      messages.push({ role: 'tool', tool_call_id: item.call_id, content: responseOutputToText(item.output) });
+      continue;
+    }
+    throw invalidResponsesRequest(`Unsupported Responses input item type: ${String(item.type || 'unknown')}`);
+  }
+
+  if (messages.length === 0) throw invalidResponsesRequest('input must contain at least one message');
+  let toolChoice = responsesReq.tool_choice;
+  if (toolChoice && typeof toolChoice === 'object' && toolChoice.type === 'function') {
+    const meta = toolState.lookup.get(toolChoice.namespace ? `${toolChoice.namespace}.${toolChoice.name}` : toolChoice.name);
+    toolChoice = { type: 'function', function: { name: meta?.ccName || sanitizeCcToolName(toolChoice.name) } };
+  }
+  const maxTokens = Number.isFinite(responsesReq.max_output_tokens) ? responsesReq.max_output_tokens : undefined;
+  return {
+    chatRequest: {
+      model: responsesReq.model,
+      messages,
+      max_tokens: maxTokens,
+      temperature: responsesReq.temperature,
+      tools: toolState.chatTools,
+      stream: true,
+      reasoning_effort: responsesReq.reasoning?.effort,
+      tool_choice: toolChoice,
+      parallel_tool_calls: responsesReq.parallel_tool_calls,
+    },
+    toolRegistry: toolState.registry,
+  };
+}
+
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
 
@@ -1212,6 +1419,281 @@ function mapFinishReason(reason) {
     case 'stop': return 'stop';
     default: return reason || 'stop';
   }
+}
+
+// ── CC NDJSON → OpenAI Responses SSE 转换 ──────────
+
+function createResponsesTranslator(responsesReq, responseId, createdAt, toolRegistry) {
+  const model = responsesReq.model;
+  let sequenceNumber = 0;
+  let nextOutputIndex = 0;
+  let textState = null;
+  let reasoningState = null;
+  let usage = null;
+  let terminal = false;
+  let failureReason = null;
+  const output = [];
+
+  const event = (type, data) => `event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: sequenceNumber++, ...data })}\n\n`;
+  const usageObject = raw => {
+    const normalized = { ...(raw || {}) };
+    normalizeUsage(normalized);
+    const inputTokens = normalized.inputTokens ?? 0;
+    const outputTokens = normalized.outputTokens ?? 0;
+    return {
+      input_tokens: inputTokens,
+      input_tokens_details: { cached_tokens: normalized.cachedInputTokens ?? 0 },
+      output_tokens: outputTokens,
+      output_tokens_details: { reasoning_tokens: normalized.reasoningTokens ?? 0 },
+      total_tokens: inputTokens + outputTokens,
+    };
+  };
+  const responseObject = (status, responseOutput, responseUsage, error = null) => ({
+    id: responseId,
+    object: 'response',
+    created_at: createdAt,
+    status,
+    completed_at: status === 'completed' || status === 'failed' ? nowUnix() : null,
+    error,
+    incomplete_details: null,
+    instructions: responsesReq.instructions ?? null,
+    max_output_tokens: responsesReq.max_output_tokens ?? null,
+    model,
+    output: responseOutput,
+    parallel_tool_calls: responsesReq.parallel_tool_calls ?? true,
+    previous_response_id: null,
+    reasoning: responsesReq.reasoning ?? null,
+    store: false,
+    temperature: responsesReq.temperature ?? null,
+    text: responsesReq.text ?? { format: { type: 'text' } },
+    tool_choice: responsesReq.tool_choice ?? 'auto',
+    tools: responsesReq.tools ?? [],
+    top_p: responsesReq.top_p ?? null,
+    truncation: responsesReq.truncation ?? 'disabled',
+    usage: responseUsage,
+  });
+  const startText = () => {
+    if (textState) return [];
+    const id = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+    textState = { id, index: nextOutputIndex++, text: '' };
+    return [
+      event('response.output_item.added', {
+        output_index: textState.index,
+        item: { id, type: 'message', role: 'assistant', status: 'in_progress', content: [] },
+      }),
+      event('response.content_part.added', {
+        item_id: id,
+        output_index: textState.index,
+        content_index: 0,
+        part: { type: 'output_text', text: '', annotations: [], logprobs: [] },
+      }),
+    ];
+  };
+  const startReasoning = () => {
+    if (reasoningState) return [];
+    const id = `rs_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+    reasoningState = { id, index: nextOutputIndex++, text: '' };
+    return [
+      event('response.output_item.added', {
+        output_index: reasoningState.index,
+        item: { id, type: 'reasoning', status: 'in_progress', summary: [] },
+      }),
+      event('response.reasoning_summary_part.added', {
+        item_id: id,
+        output_index: reasoningState.index,
+        summary_index: 0,
+        part: { type: 'summary_text', text: '' },
+      }),
+    ];
+  };
+  const finishReasoning = () => {
+    if (!reasoningState || output[reasoningState.index]) return [];
+    const item = {
+      id: reasoningState.id,
+      type: 'reasoning',
+      status: 'completed',
+      summary: [{ type: 'summary_text', text: reasoningState.text }],
+    };
+    output[reasoningState.index] = item;
+    return [
+      event('response.reasoning_summary_text.done', {
+        item_id: reasoningState.id,
+        output_index: reasoningState.index,
+        summary_index: 0,
+        text: reasoningState.text,
+      }),
+      event('response.reasoning_summary_part.done', {
+        item_id: reasoningState.id,
+        output_index: reasoningState.index,
+        summary_index: 0,
+        part: item.summary[0],
+      }),
+      event('response.output_item.done', { output_index: reasoningState.index, item }),
+    ];
+  };
+  const finishText = () => {
+    if (!textState || output[textState.index]) return [];
+    const part = { type: 'output_text', text: textState.text, annotations: [], logprobs: [] };
+    const item = { id: textState.id, type: 'message', role: 'assistant', status: 'completed', content: [part] };
+    output[textState.index] = item;
+    return [
+      event('response.output_text.done', {
+        item_id: textState.id,
+        output_index: textState.index,
+        content_index: 0,
+        text: textState.text,
+        logprobs: [],
+      }),
+      event('response.content_part.done', {
+        item_id: textState.id,
+        output_index: textState.index,
+        content_index: 0,
+        part,
+      }),
+      event('response.output_item.done', { output_index: textState.index, item }),
+    ];
+  };
+  const toolMetaFor = name => toolRegistry.get(name)
+    || [...toolRegistry.values()].find(meta => meta.name === name || meta.qualifiedName === name)
+    || null;
+  const finishToolCall = ccEvent => {
+    const callId = ccEvent.toolCallId || `call_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+    const meta = toolMetaFor(ccEvent.toolName || '');
+    const index = nextOutputIndex++;
+    const itemId = `${meta?.type === 'custom' ? 'ctc' : 'fc'}_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+    const base = {
+      id: itemId,
+      call_id: callId,
+      name: meta?.name || ccEvent.toolName || '',
+      ...(meta?.namespace ? { namespace: meta.namespace } : {}),
+    };
+    let item;
+    let deltaType;
+    let doneType;
+    let argumentValue;
+    if (meta?.type === 'custom') {
+      argumentValue = typeof ccEvent.input === 'string'
+        ? ccEvent.input
+        : (typeof ccEvent.input?.input === 'string' ? ccEvent.input.input : JSON.stringify(ccEvent.input || {}));
+      item = { ...base, type: 'custom_tool_call', status: 'completed', input: argumentValue };
+      deltaType = 'response.custom_tool_call_input.delta';
+      doneType = 'response.custom_tool_call_input.done';
+    } else {
+      argumentValue = typeof ccEvent.input === 'string' ? ccEvent.input : JSON.stringify(ccEvent.input || {});
+      item = { ...base, type: 'function_call', status: 'completed', arguments: argumentValue };
+      deltaType = 'response.function_call_arguments.delta';
+      doneType = 'response.function_call_arguments.done';
+    }
+    output[index] = item;
+    const pendingItem = { ...item, status: 'in_progress', ...(item.type === 'custom_tool_call' ? { input: '' } : { arguments: '' }) };
+    return [
+      event('response.output_item.added', { output_index: index, item: pendingItem }),
+      event(deltaType, { item_id: itemId, output_index: index, call_id: callId, delta: argumentValue }),
+      event(doneType, {
+        item_id: itemId,
+        output_index: index,
+        call_id: callId,
+        ...(item.type === 'custom_tool_call' ? { input: argumentValue } : { arguments: argumentValue }),
+      }),
+      event('response.output_item.done', { output_index: index, item }),
+    ];
+  };
+  const fail = (code, message) => {
+    if (terminal) return [];
+    terminal = true;
+    failureReason = code;
+    const error = { code, message };
+    return [event('response.failed', { response: responseObject('failed', output.filter(Boolean), usage ? usageObject(usage) : null, error) })];
+  };
+
+  return {
+    lastCcEvent: '',
+    inputTokens: 0,
+    outputTokens: 0,
+    cachedInputTokens: 0,
+    get terminal() { return terminal; },
+    get failureReason() { return failureReason; },
+    startEvents() {
+      const initial = responseObject('in_progress', [], null);
+      return [event('response.created', { response: initial }), event('response.in_progress', { response: initial })];
+    },
+    parseLine(line) {
+      if (terminal) return null;
+      const trimmed = line.trim();
+      if (!trimmed || trimmed === '[DONE]' || trimmed.startsWith(':')) return null;
+      let ccEvent;
+      try { ccEvent = JSON.parse(trimmed); } catch { return null; }
+      if (!ccEvent.type) return null;
+      this.lastCcEvent = ccEvent.type;
+      const events = [];
+      switch (ccEvent.type) {
+        case 'text-delta': {
+          const delta = ccEvent.text || ccEvent.delta || '';
+          if (!delta) break;
+          events.push(...startText());
+          textState.text += delta;
+          events.push(event('response.output_text.delta', {
+            item_id: textState.id,
+            output_index: textState.index,
+            content_index: 0,
+            delta,
+            logprobs: [],
+          }));
+          break;
+        }
+        case 'reasoning-delta': {
+          const delta = ccEvent.text || ccEvent.delta || '';
+          if (!delta) break;
+          events.push(...startReasoning());
+          reasoningState.text += delta;
+          events.push(event('response.reasoning_summary_text.delta', {
+            item_id: reasoningState.id,
+            output_index: reasoningState.index,
+            summary_index: 0,
+            delta,
+          }));
+          break;
+        }
+        case 'tool-call':
+          events.push(...finishToolCall(ccEvent));
+          break;
+        case 'finish-step':
+          if (ccEvent.usage) usage = ccEvent.usage;
+          break;
+        case 'finish': {
+          usage = ccEvent.totalUsage || usage || {};
+          this.inputTokens = usage.inputTokens ?? 0;
+          this.outputTokens = usage.outputTokens ?? 0;
+          this.cachedInputTokens = usage.cachedInputTokens ?? 0;
+          if (!Number(this.outputTokens)) return fail('rate_limit_error', 'Empty response from upstream (zero output tokens)');
+          events.push(...finishReasoning(), ...finishText());
+          terminal = true;
+          events.push(event('response.completed', {
+            response: responseObject('completed', output.filter(Boolean), usageObject(usage)),
+          }));
+          break;
+        }
+        case 'error': {
+          const message = ccEvent.error?.message || ccEvent.message || 'Command Code upstream stream error';
+          log('warn', 'CC Responses stream error', { message });
+          return fail('upstream_error', message);
+        }
+        case 'text-start': case 'text-end': case 'reasoning-start': case 'reasoning-end':
+        case 'start': case 'start-step': case 'provider-metadata': case 'tool-input-start':
+        case 'tool-input-delta': case 'tool-input-end': case 'tool-error':
+          break;
+        default:
+          log('warn', 'Unknown CC event type in Responses API', { type: ccEvent.type });
+          break;
+      }
+      return events.length ? events : null;
+    },
+    fail,
+    getFinalResponse() {
+      if (!terminal || failureReason) return null;
+      return responseObject('completed', output.filter(Boolean), usageObject(usage));
+    },
+  };
 }
 
 // ── 错误映射 ───────────────────────────────────────
@@ -1690,6 +2172,161 @@ async function handleChatCompletions(req, res) {
       log('error', 'Upstream error', { message: e.message });
       try { abortController.abort(); } catch {} // 打断 CC 上游
       sendJSON(res, 502, { error: { message: `Upstream error: ${e.message}`, type: 'proxy_error', input_tokens: 0 }, retry_after: 10 });
+    }
+  }
+}
+
+async function handleResponses(req, res) {
+  let responsesReq;
+  try {
+    responsesReq = await readBody(req);
+  } catch {
+    sendJSON(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+    return;
+  }
+
+  let converted;
+  try {
+    converted = convertResponsesRequest(responsesReq);
+  } catch (error) {
+    sendJSON(res, 400, { error: { message: error.message || 'Invalid Responses request', type: 'invalid_request_error' } });
+    return;
+  }
+
+  const apiKey = await getApiKey(req.headers);
+  if (!apiKey) {
+    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
+    return;
+  }
+
+  const stream = responsesReq.stream === true;
+  const responseId = `resp_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+  const createdAt = nowUnix();
+  const ccBody = buildCcRequest(converted.chatRequest);
+  const translator = createResponsesTranslator(responsesReq, responseId, createdAt, converted.toolRegistry);
+  const abortController = new AbortController();
+  const startTime = Date.now();
+  let aborted = false;
+  let reader = null;
+  let bytesReceived = 0;
+
+  try {
+    const upstream = await forwardWithPoolFailover(ccBody, apiKey, req.headers, abortController.signal);
+    const ccResponse = upstream.response;
+    if (!ccResponse?.ok) {
+      const errorText = upstream.errorText ?? await ccResponse?.text().catch(() => '') ?? '';
+      log('error', 'CC API error', { path: '/v1/responses', status: ccResponse?.status || 502 });
+      const mapped = mapCcError(ccResponse?.status || 502, errorText);
+      sendJSON(res, mapped.status, mapped.body);
+      return;
+    }
+
+    res.on('close', () => {
+      if (res.writableEnded) return;
+      aborted = true;
+      log('warn', 'Client disconnected', {
+        path: '/v1/responses',
+        model: responsesReq.model,
+        responseId,
+        elapsedMs: Date.now() - startTime,
+        bytesReceived,
+        lastCcEvent: translator.lastCcEvent || '(none)',
+      });
+      if (!abortController.signal.aborted) {
+        try { abortController.abort(); } catch {}
+      }
+    });
+
+    reader = ccResponse.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const processBuffer = (flush = false, writeEvents = false) => {
+      const lines = buffer.split('\n');
+      buffer = flush ? '' : (lines.pop() || '');
+      if (flush && lines.at(-1) === '') lines.pop();
+      for (const line of lines) {
+        const events = translator.parseLine(line);
+        if (writeEvents && events) for (const responseEvent of events) res.write(responseEvent);
+      }
+    };
+
+    if (stream) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      for (const responseEvent of translator.startEvents()) res.write(responseEvent);
+    }
+
+    while (true) {
+      const result = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('STREAM_IDLE_TIMEOUT')), stream ? STREAM_IDLE_TIMEOUT_MS : NONSTREAM_IDLE_TIMEOUT_MS)),
+      ]);
+      const { done, value } = result;
+      if (done || aborted) break;
+      bytesReceived += value.length;
+      buffer += decoder.decode(value, { stream: true });
+      processBuffer(false, stream);
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) processBuffer(true, stream);
+
+    if (aborted) return;
+    if (!translator.terminal) {
+      const events = translator.fail('upstream_error', 'Command Code stream closed before a finish event');
+      if (stream) for (const responseEvent of events) res.write(responseEvent);
+    }
+
+    if (stream) {
+      if (!translator.failureReason) consecutiveTimeouts = 0;
+      if (!res.writableEnded) res.end();
+      return;
+    }
+
+    const finalResponse = translator.getFinalResponse();
+    if (!finalResponse) {
+      const isRateLimit = translator.failureReason === 'rate_limit_error';
+      sendJSON(res, isRateLimit ? 429 : 502, {
+        error: {
+          message: isRateLimit ? 'Empty response from upstream (zero output tokens)' : 'Upstream response did not complete',
+          type: translator.failureReason || 'upstream_error',
+        },
+        ...(isRateLimit ? { retry_after: 10 } : {}),
+      });
+      return;
+    }
+    consecutiveTimeouts = 0;
+    sendJSON(res, 200, finalResponse);
+  } catch (error) {
+    if (abortController.signal.aborted || aborted) return;
+    const timedOut = error.message === 'STREAM_IDLE_TIMEOUT';
+    if (timedOut) consecutiveTimeouts++;
+    log(timedOut ? 'warn' : 'error', timedOut ? 'Responses stream idle timeout' : 'Responses upstream error', {
+      path: '/v1/responses',
+      model: responsesReq.model,
+      responseId,
+      elapsedMs: Date.now() - startTime,
+      bytesReceived,
+      lastCcEvent: translator.lastCcEvent || '(none)',
+      message: error.message,
+    });
+    try { reader?.cancel(); } catch {}
+    try { abortController.abort(); } catch {}
+    if (stream && res.headersSent) {
+      const events = translator.fail(timedOut ? 'rate_limit_error' : 'upstream_error', timedOut ? 'Response timeout - request timed out' : 'Upstream stream error');
+      for (const responseEvent of events) {
+        try { res.write(responseEvent); } catch {}
+      }
+      if (!res.writableEnded) res.end();
+    } else {
+      if (timedOut) res.setHeader('Retry-After', '5');
+      sendJSON(res, timedOut ? 429 : 502, {
+        error: { message: timedOut ? 'Response timeout - request timed out' : `Upstream error: ${error.message}`, type: timedOut ? 'rate_limit_error' : 'proxy_error' },
+        ...(timedOut ? { retry_after: 5 } : {}),
+      });
     }
   }
 }
@@ -3004,6 +3641,8 @@ const server = http.createServer(async (req, res) => {
   try {
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
       await handleChatCompletions(req, res);
+    } else if (url.pathname === '/v1/responses' && req.method === 'POST') {
+      await handleResponses(req, res);
     } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
       await handleMessages(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {

@@ -6,7 +6,7 @@
 
 基于对官方 CLI 网络流量的分析，精确还原了 Command Code API 的请求协议（含设备指纹与生命周期预请求），并实现了多层兼容适配。
 
-**完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
+**完整功能**：OpenAI Responses API（Codex CLI 0.153+）+ Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用（含 Responses namespace/custom tool）| 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
 **社区**: [Linux.do](https://linux.do) — 一个友好的中文技术社区。
 
@@ -123,6 +123,27 @@ commandcode/
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 
 ## API 接口
+
+### `POST /v1/responses`
+
+面向 Codex CLI 0.153 及以上版本的 OpenAI Responses 兼容接口。支持字符串或 item 数组形式的 `input`、developer/system/user/assistant 消息、reasoning summary、function call、Codex `additional_tools` namespace、custom grammar 工具、工具结果、多模态图片，以及 SSE／非流式响应。
+
+该适配器保持无状态：支持 Codex 默认的 `store = false` 完整上下文请求；`store = true`、`previous_response_id`、`conversation`、后台任务、`item_reference`、文件输入和 OpenAI 托管工具在 Command Code 上游没有等价能力，因此会明确返回 `400`，不会静默丢失上下文或伪装支持。
+
+在 `~/.codex/config.toml` 中配置：
+
+```toml
+model = "gpt-5.6-luna"
+model_provider = "commandcode_proxy"
+
+[model_providers.commandcode_proxy]
+name = "Command Code Proxy"
+base_url = "http://你的反代IP:33000/v1"
+env_key = "COMMANDCODE_PROXY_KEY"
+wire_api = "responses"
+```
+
+启动 Codex 前，将环境变量 `COMMANDCODE_PROXY_KEY` 设置为账号池专属 `proxyKey`（推荐）或 Command Code 的 `user_...` Key。不要把真实 Key 直接写进 `config.toml`。
 
 ### `POST /v1/chat/completions`
 
