@@ -59,7 +59,7 @@ commandcode/
 | `logFile` | `""` | Log file path (empty = console only) |
 | `logLevel` | `info` | Log level |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
-| `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
+| `modelRefreshIntervalMs` | `86400000` | Background model catalog refresh interval (24 hours; also syncs once at startup when a server-side key is available) |
 
 ### Environment Variables
 
@@ -71,6 +71,7 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs` |
 
 ## API Endpoints
 
@@ -255,7 +256,7 @@ data: {"type":"message_stop"}
 
 ### `GET /v1/models`
 
-Returns available model list. Fetched dynamically from Provider API (5 min cache), falls back to hardcoded list on failure.
+Returns the cached live model catalog. The proxy synchronizes once at startup and then every 24 hours by default; a failed refresh keeps the last successful catalog instead of rolling back to the offline fallback.
 
 ### `GET /health`
 
@@ -272,7 +273,7 @@ Health check. Returns `OK`.
 
 ## Model List
 
-The proxy returns a live model list via `GET /v1/models`. Below are common models for reference; the actual list depends on the live API response — see [Command Code Pricing](https://commandcode.ai/docs/resources/pricing-limits) for plan details.
+The proxy synchronizes the live Provider catalog once at startup and then every 24 hours by default. If no server-side key has been configured yet, the first authenticated API request supplies one in memory for later background refreshes. Below are common offline fallback models; the actual list depends on the live API response — see [Command Code Pricing](https://commandcode.ai/docs/resources/pricing-limits) for plan details.
 
 ### Common Models
 
@@ -280,9 +281,9 @@ The proxy returns a live model list via `GET /v1/models`. Below are common model
 |----------|----------|
 | `claude-sonnet-4-6` / `claude-opus-4-8` / `claude-opus-4-7` / `claude-haiku-4-5-20251001` | Anthropic |
 | `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` | OpenAI |
-| `deepseek/deepseek-v4-pro` / `deepseek/deepseek-v4-flash` | DeepSeek |
+| `deepseek/deepseek-v4-pro` / `deepseek/deepseek-v4-flash` / `deepseek/deepseek-v4.1-flash` | DeepSeek |
 | `moonshotai/Kimi-K2.6` / `moonshotai/Kimi-K2.5` | Kimi |
-| `zai-org/GLM-5.1` / `zai-org/GLM-5` | GLM |
+| `z-ai/glm-5.3-flash` / `z-ai/glm-5.3-flashx` / `zai-org/GLM-5.3` / `zai-org/GLM-5.2` / `zai-org/GLM-5.1` / `zai-org/GLM-5` | GLM |
 | `MiniMaxAI/MiniMax-M3` / `MiniMaxAI/MiniMax-M2.7` / `MiniMaxAI/MiniMax-M2.5` | MiniMax |
 | `Qwen/Qwen3.7-Max` / `Qwen/Qwen3.6-Max-Preview` / `Qwen/Qwen3.6-Plus` | Qwen |
 | `stepfun/Step-3.7-Flash` / `stepfun/Step-3.5-Flash` | Step |

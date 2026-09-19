@@ -59,7 +59,7 @@ commandcode/
 | `logFile` | `""` | 日志文件路径（空=仅控制台） |
 | `logLevel` | `info` | 日志级别 |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
-| `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
+| `modelRefreshIntervalMs` | `86400000` | 模型目录后台刷新间隔（默认 24 小时；存在服务端 Key 时启动也会同步一次） |
 | `usageAllowedIps` | `['*']` | 无鉴权 `/usage` 的允许来源 IP；`'*'` 表示允许所有容器/宿主机来源 |
 | `adminAuth` | 见下文 | 在线账号设置的登录与来源限制；默认关闭 |
 | `accountPool` | 见下文 | 多账号池；默认关闭，开启后用一个专属代理 Key 调用所有已启用账号 |
@@ -121,6 +121,7 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs` |
 
 ## API 接口
 
@@ -307,7 +308,7 @@ data: {"type":"message_stop"}
 
 ### `GET /v1/models`
 
-返回可用模型列表。优先从 Provider API 动态拉取（5min 缓存），失败回退硬编码列表。
+返回缓存的实时模型目录。代理启动时同步一次，之后默认每 24 小时后台同步；刷新失败时保留最后一次成功目录，不会退回旧的离线列表。
 
 ### `GET /health`
 
@@ -338,7 +339,7 @@ curl 'http://127.0.0.1:3050/usage?format=json'
 
 ## 模型列表
 
-代理访问 `GET /v1/models` 会返回实时模型列表。以下为常见模型参考，完整列表以实际接口返回为准——各模型套餐可参考 [Command Code Pricing](https://commandcode.ai/docs/resources/pricing-limits)。
+代理启动时会同步一次 Provider 实时模型目录，之后默认每 24 小时在后台同步。如果尚未配置服务端账号，第一次携带有效 Key 的 API 请求会在内存中为后续后台刷新提供凭据。以下仅为常见离线兜底模型，完整列表以实时接口返回为准——各模型套餐可参考 [Command Code Pricing](https://commandcode.ai/docs/resources/pricing-limits)。
 
 ### 常用模型
 
@@ -346,9 +347,9 @@ curl 'http://127.0.0.1:3050/usage?format=json'
 |---------|--------|
 | `claude-sonnet-4-6` / `claude-opus-4-8` / `claude-opus-4-7` / `claude-haiku-4-5-20251001` | Anthropic |
 | `gpt-5.5` / `gpt-5.4` / `gpt-5.4-mini` / `gpt-5.3-codex` | OpenAI |
-| `deepseek/deepseek-v4-pro` / `deepseek/deepseek-v4-flash` | DeepSeek |
+| `deepseek/deepseek-v4-pro` / `deepseek/deepseek-v4-flash` / `deepseek/deepseek-v4.1-flash` | DeepSeek |
 | `moonshotai/Kimi-K2.6` / `moonshotai/Kimi-K2.5` | Kimi |
-| `zai-org/GLM-5.1` / `zai-org/GLM-5` | GLM |
+| `z-ai/glm-5.3-flash` / `z-ai/glm-5.3-flashx` / `zai-org/GLM-5.3` / `zai-org/GLM-5.2` / `zai-org/GLM-5.1` / `zai-org/GLM-5` | GLM |
 | `MiniMaxAI/MiniMax-M3` / `MiniMaxAI/MiniMax-M2.7` / `MiniMaxAI/MiniMax-M2.5` | MiniMax |
 | `Qwen/Qwen3.7-Max` / `Qwen/Qwen3.6-Max-Preview` / `Qwen/Qwen3.6-Plus` | Qwen |
 | `stepfun/Step-3.7-Flash` / `stepfun/Step-3.5-Flash` | Step |

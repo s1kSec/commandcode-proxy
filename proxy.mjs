@@ -49,7 +49,7 @@ function loadConfig() {
     logFile: '',
     logLevel: 'info',
     useProviderModels: true,
-    modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
+    modelRefreshIntervalMs: 24 * 60 * 60 * 1000,  // 24 hours
     usageAllowedIps: ['*'],
     adminAuth: {
       enabled: false,
@@ -84,6 +84,7 @@ function loadConfig() {
   if (process.env.PROJECT_SLUG) defaults.projectSlug = process.env.PROJECT_SLUG;
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
+  if (process.env.CC_MODEL_REFRESH_INTERVAL_MS) defaults.modelRefreshIntervalMs = Number(process.env.CC_MODEL_REFRESH_INTERVAL_MS);
 
   try {
     const apiBase = new URL(defaults.apiBase);
@@ -95,6 +96,11 @@ function loadConfig() {
   if (!Array.isArray(defaults.usageAllowedIps) || defaults.usageAllowedIps.some(ip => typeof ip !== 'string' || (ip !== '*' && isIP(ip) === 0))) {
     throw new Error('[config] usageAllowedIps must be an array containing "*" and/or literal IPv4/IPv6 addresses');
   }
+  const modelRefreshIntervalMs = Number(defaults.modelRefreshIntervalMs);
+  if (!Number.isFinite(modelRefreshIntervalMs) || modelRefreshIntervalMs < 60 * 1000 || modelRefreshIntervalMs > 7 * 24 * 60 * 60 * 1000) {
+    throw new Error('[config] modelRefreshIntervalMs must be between 60000 and 604800000 milliseconds');
+  }
+  defaults.modelRefreshIntervalMs = modelRefreshIntervalMs;
 
   return defaults;
 }
@@ -846,6 +852,8 @@ const MODELS = [
   { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
   // OpenAI
   { id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna' },
+  { id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' },
+  { id: 'gpt-5.6-terra', name: 'GPT-5.6 Terra' },
   { id: 'gpt-5.5', name: 'GPT-5.5' },
   { id: 'gpt-5.4', name: 'GPT-5.4' },
   { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
@@ -853,12 +861,19 @@ const MODELS = [
   // DeepSeek
   { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
   { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
+  { id: 'deepseek/deepseek-v4-flash-fast', name: 'DeepSeek V4 Flash Fast' },
+  { id: 'deepseek/deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' },
   // Kimi
   { id: 'moonshotai/Kimi-K2.6', name: 'Kimi K2.6' },
   { id: 'moonshotai/Kimi-K2.5', name: 'Kimi K2.5' },
   // GLM
   { id: 'zai-org/GLM-5.1', name: 'GLM 5.1' },
   { id: 'zai-org/GLM-5', name: 'GLM 5' },
+  { id: 'z-ai/glm-5.3-flash', name: 'GLM 5.3 Flash' },
+  { id: 'z-ai/glm-5.3-flashx', name: 'GLM 5.3 FlashX' },
+  { id: 'zai-org/GLM-5.2', name: 'GLM 5.2' },
+  { id: 'zai-org/GLM-5.2-Fast', name: 'GLM 5.2 Fast' },
+  { id: 'zai-org/GLM-5.3', name: 'GLM 5.3' },
   // MiniMax
   { id: 'MiniMaxAI/MiniMax-M3', name: 'MiniMax M3' },
   { id: 'MiniMaxAI/MiniMax-M2.7', name: 'MiniMax M2.7' },
@@ -1796,11 +1811,15 @@ async function getApiKey(headers) {
     // 真正的上游配额错误仍沿用原有 failover 流程切换账号。
     void refreshPoolUsage().catch(error => log('warn', 'Background pool usage refresh failed', { message: error.message }));
     // 所有账号已被本地标记为耗尽时，仍交给上游返回规范的 429，而非误报为缺少 Key。
-    return selectPoolAccount()?.apiKey || ACCOUNT_POOL.accounts[0]?.apiKey || null;
+    const apiKey = selectPoolAccount()?.apiKey || ACCOUNT_POOL.accounts[0]?.apiKey || null;
+    rememberModelsApiKey(apiKey);
+    return apiKey;
   }
   // 与原实现兼容：客户端可携带含 user_ key 的既有 Bearer 包装格式。
   const match = credential?.match(/user_[a-zA-Z0-9_-]+/);
-  return match && COMMAND_CODE_KEY_RE.test(match[0]) ? match[0] : null;
+  const apiKey = match && COMMAND_CODE_KEY_RE.test(match[0]) ? match[0] : null;
+  rememberModelsApiKey(apiKey);
+  return apiKey;
 }
 
 // ── 流式转发 ────────────────────────────────────────
@@ -3029,44 +3048,83 @@ async function handleMessages(req, res) {
 
 let dynamicModels = null;
 let modelsLastFetch = 0;
+let modelsLastApiKey = null;
+let modelsRefreshPromise = null;
 
-async function fetchModels(apiKey) {
+function rememberModelsApiKey(apiKey) {
+  if (typeof apiKey === 'string' && COMMAND_CODE_KEY_RE.test(apiKey)) modelsLastApiKey = apiKey;
+}
+
+function getBackgroundModelsApiKey() {
+  if (modelsLastApiKey) return modelsLastApiKey;
+  if (ACCOUNT_POOL.enabled && ACCOUNT_POOL.accounts.length > 0) return ACCOUNT_POOL.accounts[0].apiKey;
+  return typeof CFG.apiKey === 'string' && COMMAND_CODE_KEY_RE.test(CFG.apiKey) ? CFG.apiKey : null;
+}
+
+function normalizeProviderModels(data) {
+  if (!Array.isArray(data?.data)) return null;
+  const ids = new Set();
+  const models = [];
+  for (const model of data.data) {
+    const id = typeof model?.id === 'string' ? model.id.trim() : '';
+    if (!id || id.length > 256 || !/^[A-Za-z0-9._:/-]+$/.test(id) || ids.has(id)) continue;
+    ids.add(id);
+    models.push({ id, name: id });
+  }
+  return models.length > 0 ? models : null;
+}
+
+async function fetchModels(apiKey, { force = false } = {}) {
+  rememberModelsApiKey(apiKey);
   const now = Date.now();
-  if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
+  if (!force && dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
     return dynamicModels;
   }
 
-  try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
+  if (!CFG.useProviderModels) return dynamicModels || MODELS;
+  const catalogApiKey = apiKey || getBackgroundModelsApiKey();
+  if (!catalogApiKey) return dynamicModels || MODELS;
+  if (modelsRefreshPromise) return modelsRefreshPromise;
 
-    const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'x-cli-environment': 'production',
-        'x-command-code-version': CC_VERSION,
-      },
-      signal: AbortSignal.timeout(10000),
-    });
+  const refresh = (async () => {
+    try {
+      const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
+        headers: {
+          'Authorization': `Bearer ${catalogApiKey}`,
+          'x-cli-environment': 'production',
+          'x-command-code-version': CC_VERSION,
+        },
+        signal: AbortSignal.timeout(10000),
+      });
 
-    if (response.ok) {
-      const data = await response.json();
-      if (Array.isArray(data.data)) {
-        dynamicModels = data.data.map(m => ({
-          id: m.id,
-          name: m.id,
-        }));
-        modelsLastFetch = now;
+      if (response.ok) {
+        const models = normalizeProviderModels(await response.json());
+        if (!models) throw new Error('Provider returned an empty or invalid model catalog');
+        dynamicModels = models;
+        modelsLastFetch = Date.now();
+        rememberModelsApiKey(catalogApiKey);
         log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
         return dynamicModels;
       }
+      log('warn', 'Provider models fetch failed, keeping last known catalog', { status: response.status });
+    } catch (e) {
+      log('warn', 'Provider models fetch error, keeping last known catalog', { error: e.message });
     }
-    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
-  } catch (e) {
-    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
-  }
+    return dynamicModels || MODELS;
+  })();
 
-  // Fallback to hardcoded MODELS
-  return MODELS;
+  modelsRefreshPromise = refresh;
+  try {
+    return await refresh;
+  } finally {
+    if (modelsRefreshPromise === refresh) modelsRefreshPromise = null;
+  }
+}
+
+async function refreshModelsInBackground() {
+  const apiKey = getBackgroundModelsApiKey();
+  if (!apiKey || !CFG.useProviderModels) return;
+  await fetchModels(apiKey, { force: true });
 }
 
 async function handleModels(req, res) {
@@ -3694,4 +3752,13 @@ server.listen(CFG.port, CFG.host, () => {
   if (!CFG.apiKey) {
     log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
   }
+  // Proactively synchronize the catalog at startup and once per configured
+  // interval. A successful catalog remains available when a later refresh
+  // fails, so a transient upstream outage never rolls clients back to stale
+  // hardcoded IDs.
+  void refreshModelsInBackground();
+  const modelsRefreshTimer = setInterval(() => {
+    void refreshModelsInBackground();
+  }, CFG.modelRefreshIntervalMs);
+  modelsRefreshTimer.unref();
 });

@@ -6,6 +6,8 @@
   "projectSlug": "cc-proxy",
   "logFile": "",
   "logLevel": "info",
+  "useProviderModels": true,
+  "modelRefreshIntervalMs": 86400000,
   "usageAllowedIps": ["*"],
   "adminAuth": {
     "enabled": false,
