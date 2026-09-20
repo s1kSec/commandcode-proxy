@@ -54,12 +54,19 @@ commandcode/
 | `port` | `3000` | 监听端口（仓库自带 config.json 为 3050） |
 | `host` | `0.0.0.0` | 监听地址 |
 | `apiBase` | `https://api.commandcode.ai` | CC API 地址 |
-| `projectSlug` | `cc-proxy` | `x-project-slug` header |
+| `projectSlug` | `cc-proxy` | 旧版兼容字段；协议对齐后 `x-project-slug` 从 `deviceProjectDir` 推导 |
 | `apiKey` | `""` | 可选兜底 API Key（请求也可通过 header 传入） |
 | `logFile` | `""` | 日志文件路径（空=仅控制台） |
 | `logLevel` | `info` | 日志级别 |
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `86400000` | 模型目录后台刷新间隔（默认 24 小时；存在服务端 Key 时启动也会同步一次） |
+| `zdr` | `false` | 为生成和初始化请求发送 `x-cmd-zdr: 1` |
+| `cliMode` | `agent` | 对齐 CLI 请求信封的工作模式 |
+| `cliSessionMode` | `interactive` | 生命周期事件模式：`interactive` 或 `non-interactive` |
+| `fingerprintSalt` | `""` | 可选设备身份派生盐；修改后所有账号会呈现新设备 |
+| `deviceProjectDir` | `""` | 统一用于请求体工作目录和项目 slug 的设备目录；空值使用内置 Windows 路径 |
+| `emptySystemPlaceholder` | `true` | 无 system 提示时发送空格占位，避免上游注入默认长提示词 |
+| `upstreamProxy` | `""` | 可选 HTTP CONNECT 上游代理；所有 CC 请求共用同一出口，日志自动隐藏凭据 |
 | `usageAllowedIps` | `['*']` | 无鉴权 `/usage` 的允许来源 IP；`'*'` 表示允许所有容器/宿主机来源 |
 | `adminAuth` | 见下文 | 在线账号设置的登录与来源限制；默认关闭 |
 | `accountPool` | 见下文 | 多账号池；默认关闭，开启后用一个专属代理 Key 调用所有已启用账号 |
@@ -122,6 +129,15 @@ commandcode/
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 | `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs` |
+| `CMD_ZDR` | `zdr`（`1` 为启用） |
+| `CC_CLI_MODE` | `cliMode` |
+| `CC_CLI_SESSION_MODE` | `cliSessionMode` |
+| `CC_FINGERPRINT_SALT` | `fingerprintSalt` |
+| `CC_DEVICE_PROJECT_DIR` | `deviceProjectDir` |
+| `CC_EMPTY_SYSTEM_PLACEHOLDER` | `emptySystemPlaceholder` |
+| `CC_UPSTREAM_PROXY` | `upstreamProxy` |
+
+协议兼容层固定声明已经实际对齐的 `command-code@1.53.1`。npm 出现更新时只记录漂移告警，不会在请求结构尚未同步时伪报新版本。设备指纹按账号 Key 确定性派生，重启和多实例保持一致；Key 本身不会写入指纹、日志或响应。
 
 ## API 接口
 

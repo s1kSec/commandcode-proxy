@@ -8,6 +8,13 @@
   "logLevel": "info",
   "useProviderModels": true,
   "modelRefreshIntervalMs": 86400000,
+  "zdr": false,
+  "cliMode": "agent",
+  "cliSessionMode": "interactive",
+  "fingerprintSalt": "",
+  "deviceProjectDir": "",
+  "emptySystemPlaceholder": true,
+  "upstreamProxy": "",
   "usageAllowedIps": ["*"],
   "adminAuth": {
     "enabled": false,

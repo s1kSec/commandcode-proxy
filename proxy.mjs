@@ -3,6 +3,9 @@
  * 基于真实 CLI 流量抓包数据构建
  */
 import http from 'http';
+import https from 'https';
+import tls from 'tls';
+import { Readable } from 'stream';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, unlinkSync } from 'fs';
@@ -50,6 +53,13 @@ function loadConfig() {
     logLevel: 'info',
     useProviderModels: true,
     modelRefreshIntervalMs: 24 * 60 * 60 * 1000,  // 24 hours
+    zdr: false,
+    cliMode: 'agent',
+    cliSessionMode: 'interactive',
+    fingerprintSalt: '',
+    deviceProjectDir: '',
+    emptySystemPlaceholder: true,
+    upstreamProxy: '',
     usageAllowedIps: ['*'],
     adminAuth: {
       enabled: false,
@@ -85,6 +95,13 @@ function loadConfig() {
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CC_MODEL_REFRESH_INTERVAL_MS) defaults.modelRefreshIntervalMs = Number(process.env.CC_MODEL_REFRESH_INTERVAL_MS);
+  if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
+  if (process.env.CC_FINGERPRINT_SALT !== undefined) defaults.fingerprintSalt = process.env.CC_FINGERPRINT_SALT;
+  if (process.env.CC_DEVICE_PROJECT_DIR) defaults.deviceProjectDir = process.env.CC_DEVICE_PROJECT_DIR;
+  if (process.env.CC_CLI_MODE) defaults.cliMode = process.env.CC_CLI_MODE;
+  if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
+  if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
+  if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
 
   try {
     const apiBase = new URL(defaults.apiBase);
@@ -101,6 +118,15 @@ function loadConfig() {
     throw new Error('[config] modelRefreshIntervalMs must be between 60000 and 604800000 milliseconds');
   }
   defaults.modelRefreshIntervalMs = modelRefreshIntervalMs;
+  const cliModes = new Set(['agent', 'learning', 'custom-agent', 'custom-agent-create', 'title-gen', 'tool-desc', 'compact', 'vision']);
+  if (!cliModes.has(defaults.cliMode)) throw new Error('[config] cliMode is not supported by the aligned CLI protocol');
+  if (!['interactive', 'non-interactive'].includes(defaults.cliSessionMode)) throw new Error('[config] cliSessionMode must be interactive or non-interactive');
+  for (const [name, value] of [['fingerprintSalt', defaults.fingerprintSalt], ['deviceProjectDir', defaults.deviceProjectDir], ['upstreamProxy', defaults.upstreamProxy]]) {
+    if (typeof value !== 'string' || value.length > 2048 || value.includes('\0')) throw new Error(`[config] ${name} must be a safe string`);
+  }
+  if (typeof defaults.zdr !== 'boolean' || typeof defaults.emptySystemPlaceholder !== 'boolean') {
+    throw new Error('[config] zdr and emptySystemPlaceholder must be booleans');
+  }
 
   return defaults;
 }
@@ -251,7 +277,7 @@ try {
   throw new Error(`[config] Invalid accountPool/adminAuth configuration: ${e.message}`);
 }
 
-// ── 指纹生成（首次运行自动生成，写回 config.json） ──────
+// ── 设备指纹（形态与哈希对齐 command-code@1.53.1） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
   { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },
@@ -278,27 +304,67 @@ const FINGERPRINT_TZS = [
   'Australia/Sydney', 'Pacific/Auckland',
 ];
 const FINGERPRINT_MAC_COUNT_RANGE = [2, 3, 4, 5]; // 随机 2~5 个 MAC
+const FP_SALT = 'command-code:device-fingerprint:v1';
+const DEVICE_PROFILE = {
+  platform: 'win32',
+  arch: 'x64',
+  osRelease: '10.0.22631',
+  isContainer: false,
+  projectDir: CFG.deviceProjectDir || 'C:\\Users\\dev\\projects\\app',
+};
+const FP_OS_USERS = ['dev', 'user', 'admin', 'coder', 'engineer', 'work'];
+const FP_MAIL_DOMAINS = ['gmail.com', 'outlook.com', 'qq.com', '163.com'];
 
-function generateFingerprint() {
-  const cpuEntry = FINGERPRINT_CPUS[Math.floor(Math.random() * FINGERPRINT_CPUS.length)];
-  const memGiB = FINGERPRINT_MEMS[Math.floor(Math.random() * FINGERPRINT_MEMS.length)];
-  const tz = FINGERPRINT_TZS[Math.floor(Math.random() * FINGERPRINT_TZS.length)];
-  const macCount = FINGERPRINT_MAC_COUNT_RANGE[Math.floor(Math.random() * FINGERPRINT_MAC_COUNT_RANGE.length)];
+function fpDigest(apiKey, field) {
+  return crypto.createHash('sha256')
+    .update(`${CFG.fingerprintSalt || ''}\0${apiKey}\0${field}`)
+    .digest();
+}
 
-  function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
-  function randHex(n) { return crypto.randomBytes(n).toString('hex'); }
+function fpPickIndex(apiKey, field, items, labelOf) {
+  let bestIdx = 0;
+  let bestScore = null;
+  for (let i = 0; i < items.length; i++) {
+    const score = fpDigest(apiKey, `${field}\0${labelOf(i)}`);
+    if (!bestScore || Buffer.compare(score, bestScore) > 0) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
 
-  const macHashes = [];
-  for (let i = 0; i < macCount; i++) macHashes.push(sha256(randHex(32)));
+function fingerprintHash(value) {
+  const normalized = String(value ?? '').trim();
+  if (!normalized) return undefined;
+  return crypto.createHash('sha256').update(`${FP_SALT}\0${normalized.toLowerCase()}`).digest('hex');
+}
 
-  const machineIdHash = sha256(randHex(32));
-  const osUserHash = sha256(randHex(16));
-  const hostnameHash = sha256(randHex(16));
-  const gitEmailHash = sha256(randHex(16));
-
-  // thumbmark = 所有组件的联合哈希
-  const thumbData = [machineIdHash, ...macHashes, osUserHash, hostnameHash, gitEmailHash, 'win32', '10.0.22631', cpuEntry.model, String(cpuEntry.cores), String(memGiB)].join('|');
-  const thumbmark = sha256(thumbData);
+function generateFingerprint(apiKey) {
+  const cpuEntry = FINGERPRINT_CPUS[fpPickIndex(apiKey, 'cpu', FINGERPRINT_CPUS, i => `${FINGERPRINT_CPUS[i].model}|${FINGERPRINT_CPUS[i].cores}`)];
+  const memGiB = FINGERPRINT_MEMS[fpPickIndex(apiKey, 'mem', FINGERPRINT_MEMS, i => String(FINGERPRINT_MEMS[i]))];
+  const tz = FINGERPRINT_TZS[fpPickIndex(apiKey, 'timezone', FINGERPRINT_TZS, i => FINGERPRINT_TZS[i])];
+  const macCount = FINGERPRINT_MAC_COUNT_RANGE[fpPickIndex(apiKey, 'macCount', FINGERPRINT_MAC_COUNT_RANGE, i => String(FINGERPRINT_MAC_COUNT_RANGE[i]))];
+  const osUser = FP_OS_USERS[fpPickIndex(apiKey, 'osUser', FP_OS_USERS, i => FP_OS_USERS[i])];
+  const mailDomain = FP_MAIL_DOMAINS[fpPickIndex(apiKey, 'mailDomain', FP_MAIL_DOMAINS, i => FP_MAIL_DOMAINS[i])];
+  const hex = (field, bytes) => fpDigest(apiKey, field).subarray(0, bytes).toString('hex');
+  const mid = hex('machineId', 16);
+  const machineId = `${mid.slice(0, 8)}-${mid.slice(8, 12)}-${mid.slice(12, 16)}-${mid.slice(16, 20)}-${mid.slice(20, 32)}`;
+  const macs = [];
+  for (let i = 0; i < macCount; i++) {
+    const bytes = fpDigest(apiKey, `mac${i}`).subarray(0, 6);
+    macs.push([...bytes].map(value => value.toString(16).padStart(2, '0')).join(':'));
+  }
+  macs.sort();
+  const hostname = `DESKTOP-${hex('hostname', 4).toUpperCase()}`;
+  const gitEmail = `${osUser}.${hex('gitEmail', 3)}@${mailDomain}`;
+  const machineIdHash = fingerprintHash(machineId);
+  const macHashes = macs.map(fingerprintHash).filter(Boolean);
+  const osUserHash = fingerprintHash(osUser);
+  const hostnameHash = fingerprintHash(hostname);
+  const gitEmailHash = fingerprintHash(gitEmail);
+  const thumbSeed = [machineId.trim(), macs.join(','), machineId.trim() ? '' : hostname, machineId.trim() ? '' : cpuEntry.model].filter(Boolean);
+  const thumbmark = crypto.createHash('sha256').update(`${FP_SALT}\0machine\0${thumbSeed.join('|') || 'unknown'}`).digest('hex');
 
   return {
     thumbmark,
@@ -308,13 +374,13 @@ function generateFingerprint() {
       osUserHash,
       hostnameHash,
       gitEmailHash,
-      platform: 'win32',
-      arch: 'x64',
-      osRelease: '10.0.22631',
+      platform: DEVICE_PROFILE.platform,
+      arch: DEVICE_PROFILE.arch,
+      osRelease: DEVICE_PROFILE.osRelease,
       cpuModel: cpuEntry.model,
       cpuCount: cpuEntry.cores,
       memGiB,
-      isContainer: false,
+      isContainer: DEVICE_PROFILE.isContainer,
       timezone: tz,
       runtime: 'cli',
       collectorVersion: 1,
@@ -322,27 +388,26 @@ function generateFingerprint() {
   };
 }
 
-let CC_VERSION = '0.32.3';
-const CC_VERSION_FALLBACK = '0.32.3';
-const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — npm registry 刷新间隔
+const CC_PROTOCOL_VERSION = '1.53.1';
+const CC_VERSION = CC_PROTOCOL_VERSION;
+const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000;
 
-// ── 动态 CC 版本号（从 npm registry 拉取） ─────────────
-async function refreshCCVersion() {
+async function checkProtocolDrift() {
   try {
     const url = 'https://registry.npmjs.org/command-code/latest';
     const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
     if (!res.ok) throw new Error(`npm responded with ${res.status}`);
     const pkg = await res.json();
-    if (pkg.version && typeof pkg.version === 'string') {
-      CC_VERSION = pkg.version;
-      log('info', 'CC Version refreshed from npm', { version: CC_VERSION });
-    }
+    const latest = typeof pkg?.version === 'string' ? pkg.version : null;
+    if (latest && latest !== CC_PROTOCOL_VERSION) {
+      log('warn', 'CC CLI version drift: protocol may have changed; wire version remains pinned', { implemented: CC_PROTOCOL_VERSION, latest });
+    } else if (latest) log('info', 'CC CLI version in sync', { version: latest });
   } catch (e) {
-    log('warn', 'CC Version fetch failed, using current', { version: CC_VERSION, error: e.message });
+    log('warn', 'CC version check failed', { error: e.message });
   }
 }
-refreshCCVersion(); // 启动时立即拉取
-setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
+checkProtocolDrift();
+setInterval(checkProtocolDrift, CC_VERSION_REFRESH_MS).unref();
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB — 请求体大小上限
 const STREAM_IDLE_TIMEOUT_MS = 30000;   // 30s — 流式无新数据中断
@@ -399,11 +464,13 @@ setInterval(() => {
   if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
 }, 60 * 60 * 1000); // 每小时
 
-function getSessionId(incomingHeaders, apiKey) {
+function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   // 优先从客户端传来的 session 类 header 获取
   const candidates = [
     incomingHeaders['x-session-id'],
     incomingHeaders['x-claude-code-session-id'],
+    incomingHeaders['session_id'],
+    promptCacheKey,
   ];
   for (const id of candidates) {
     if (id && typeof id === 'string' && id.length >= 8) return id;
@@ -411,9 +478,6 @@ function getSessionId(incomingHeaders, apiKey) {
   // 按 API Key 分 session
   return ensureSession(apiKey);
 }
-
-// 每个请求独立 thread ID
-function newThreadId() { return randomUUID(); }
 
 // ── 每 Key 独立状态（fingerprint + 初始化节流） ──
 // 每个 API Key 拥有自己的设备指纹和初始化定时器
@@ -423,7 +487,7 @@ function getOrCreateKeyState(apiKey) {
   let state = keyStateStore.get(apiKey);
   if (!state) {
     state = {
-      fingerprint: generateFingerprint(),
+      fingerprint: generateFingerprint(apiKey),
       nextInitAt: 0,
     };
     keyStateStore.set(apiKey, state);
@@ -448,11 +512,12 @@ async function ensureInitialized(apiKey, signal) {
       'x-cli-environment': 'production',
       'Authorization': `Bearer ${apiKey}`,
       'x-command-code-version': CC_VERSION,
+      ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
     };
     const fingerprint = state.fingerprint || {};
 
     await Promise.all([
-      fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
+      upstreamFetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
         method: 'POST', headers, signal,
         body: JSON.stringify(fingerprint),
       }).then(r => {
@@ -462,14 +527,14 @@ async function ensureInitialized(apiKey, signal) {
         if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message });
       }),
 
-      fetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
+      upstreamFetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
         method: 'POST', headers, signal,
         body: JSON.stringify({
           eventType: 'cli_session_exists',
           metadata: {
             sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
             cliVersion: CC_VERSION,
-            mode: 'interactive',
+            mode: CFG.cliSessionMode,
             os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
           },
         }),
@@ -585,7 +650,7 @@ function getPlanMonthlyCredits(planId) {
 
 async function fetchUsageJson(path, apiKey) {
   try {
-    const response = await fetch(`${CFG.apiBase}${path}`, {
+    const response = await upstreamFetch(`${CFG.apiBase}${path}`, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'x-cli-environment': 'production',
@@ -813,11 +878,11 @@ function markPoolAccountBlocked(account, responseBody) {
   log('warn', 'Pool account temporarily unavailable', { accountId: account.id, resetAt: resetAt || null });
 }
 
-async function forwardWithPoolFailover(body, initialApiKey, incomingHeaders, signal) {
+async function forwardWithPoolFailover(body, initialApiKey, incomingHeaders, signal, promptCacheKey) {
   const usingPool = isPoolProxyKey(getRequestCredential(incomingHeaders));
   if (!usingPool) {
     await ensureInitialized(initialApiKey, signal);
-    return { response: await forwardToCC(body, initialApiKey, incomingHeaders, signal), apiKey: initialApiKey, errorText: null };
+    return { response: await forwardToCC(body, initialApiKey, incomingHeaders, signal, promptCacheKey), apiKey: initialApiKey, errorText: null };
   }
 
   const attempted = new Set();
@@ -827,7 +892,7 @@ async function forwardWithPoolFailover(body, initialApiKey, incomingHeaders, sig
   while (account && !attempted.has(account.id)) {
     attempted.add(account.id);
     await ensureInitialized(account.apiKey, signal);
-    const response = await forwardToCC(body, account.apiKey, incomingHeaders, signal);
+    const response = await forwardToCC(body, account.apiKey, incomingHeaders, signal, promptCacheKey);
     if (response.ok) return { response, apiKey: account.apiKey, errorText: null };
 
     const errorText = await response.text().catch(() => '');
@@ -895,20 +960,12 @@ const MODELS = [
 
 // ── 工具函数 ───────────────────────────────────────
 
-// 从 sessionId 构造一个假的工作目录路径，再按真实 CLI 规则生成 slug
-// 结果形如 "d-users-dev-projects-web-app-a3f2" (和真实 CLI 的 slug 格式一致)
-function fakeProjectSlug(sessionId) {
-  const names = ['app', 'api', 'backend', 'bot', 'cli', 'core', 'data', 'frontend',
-    'lib', 'plugin', 'proxy', 'server', 'service', 'tool', 'web', 'worker'];
-  const name = names[parseInt(sessionId.slice(0, 4), 16) % names.length];
-  const suffix = sessionId.slice(0, 4);
-  // 模拟一个类似 C:\Users\dev\projects\{name}-{suffix} 的路径
-  const path = `C:\\Users\\dev\\projects\\${name}-${suffix}`;
-  return path
+function slugifyProjectPath(path) {
+  const slug = String(path || '')
     .toLowerCase()
-    .replace(/^[a-z]:/i, '')
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
+  return slug || 'root';
 }
 
 function generateTraceparent() {
@@ -923,10 +980,6 @@ function nowUnix() {
 
 function getDateStr() {
   return new Date().toISOString().slice(0, 10);
-}
-
-function getEnvironment() {
-  return `${process.platform}-${process.arch}, Node.js ${process.version.slice(1)}`;
 }
 
 // ── CC 请求体构建 ─────────────────────────────────
@@ -1133,18 +1186,35 @@ function convertResponsesRequest(responsesReq) {
       reasoning_effort: responsesReq.reasoning?.effort,
       tool_choice: toolChoice,
       parallel_tool_calls: responsesReq.parallel_tool_calls,
+      prompt_cache_key: responsesReq.prompt_cache_key,
     },
     toolRegistry: toolState.registry,
   };
 }
 
 function buildCcRequest(openaiReq) {
-  const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls } = openaiReq;
+  const { model, messages, max_tokens, temperature, tools, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
-  // 从 messages 中提取 system prompt
-  const systemMsgs = messages.filter(m => m.role === 'system');
-  const systemPrompt = systemMsgs.map(m => m.content).join('\n');
-  const chatMessages = messages.filter(m => m.role !== 'system');
+  // system/developer 与官方 CLI 一样编码为文本块数组，并保留缓存断点。
+  const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
+  const systemBlocks = [];
+  for (const message of systemMsgs) {
+    if (typeof message.content === 'string') {
+      if (message.content) systemBlocks.push({ type: 'text', text: message.content });
+    } else if (Array.isArray(message.content)) {
+      for (const content of message.content) {
+        const text = content?.text ?? content?.content ?? '';
+        if (text === '' && !content?.cache_control) continue;
+        const block = { type: 'text', text: String(text) };
+        if (content?.cache_control) block.cache_control = content.cache_control;
+        systemBlocks.push(block);
+      }
+    } else if (message.content != null) {
+      systemBlocks.push({ type: 'text', text: String(message.content) });
+    }
+  }
+  for (let i = 0; i < systemBlocks.length - 1; i++) systemBlocks[i].text += '\n';
+  const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
   const toolNameMap = {};
@@ -1169,8 +1239,8 @@ function buildCcRequest(openaiReq) {
         const parts = msg.content.map(part => {
           if (part.type === 'image_url') {
             const url = part.image_url?.url || '';
-            // CC CLI 真实格式: { type: "image", image: "data:image/jpeg;base64,..." }
-            return { type: 'image', image: url };
+            const mimeType = /^data:([^;,]+)/.exec(url)?.[1];
+            return { type: 'image', image: url, ...(mimeType ? { mimeType } : {}) };
           }
           return part;
         }).filter(Boolean);
@@ -1180,11 +1250,13 @@ function buildCcRequest(openaiReq) {
     }
     if (msg.role === 'assistant') {
       const parts = [];
+      if (msg.reasoning_content) parts.push({ type: 'reasoning', text: msg.reasoning_content });
       if (msg.content && typeof msg.content === 'string') {
-        parts.push({ type: 'text', text: msg.content });
+        if (msg.content) parts.push({ type: 'text', text: msg.content });
       } else if (msg.content && Array.isArray(msg.content)) {
         for (const part of msg.content) {
           if (part.type === 'text') parts.push(part);
+          else if (part.type === 'reasoning' && !msg.reasoning_content) parts.push(part);
         }
       }
       if (msg.tool_calls) {
@@ -1206,20 +1278,24 @@ function buildCcRequest(openaiReq) {
           type: 'tool-result',
           toolCallId: msg.tool_call_id,
           toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
-          output: { type: 'text', value: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) },
+          output: { type: 'text', value: toWireToolOutputValue(msg.content) },
         }],
       };
     }
-    return msg;
+    return { role: 'user', content: [{ type: 'text', text: String(msg.content ?? '') }] };
   });
 
-  const threadId = newThreadId();
+  const hasCacheMarker = systemBlocks.some(block => block.cache_control)
+    || ccMessages.some(message => Array.isArray(message.content) && message.content.some(part => part?.cache_control));
+  if (prompt_cache_key && !hasCacheMarker && systemBlocks.length) {
+    systemBlocks[systemBlocks.length - 1].cache_control = { type: 'ephemeral' };
+  }
 
   const body = {
     config: {
-      workingDir: process.cwd(),
+      workingDir: DEVICE_PROFILE.projectDir,
       date: getDateStr(),
-      environment: getEnvironment(),
+      environment: DEVICE_PROFILE.platform,
       structure: [],
       isGitRepo: false,
       currentBranch: '',
@@ -1229,8 +1305,9 @@ function buildCcRequest(openaiReq) {
     },
     memory: null,
     taste: null,
-    skills: '',
+    skills: null,
     permissionMode: 'standard',
+    mode: CFG.cliMode,
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
@@ -1240,23 +1317,20 @@ function buildCcRequest(openaiReq) {
   };
 
   // 条件字段
-  if (systemPrompt) {
-    body.params.system = systemPrompt;
-  }
+  if (systemBlocks.length) body.params.system = systemBlocks;
+  else if (CFG.emptySystemPlaceholder) body.params.system = [{ type: 'text', text: ' ' }];
   if (temperature !== undefined) {
     body.params.temperature = temperature;
   }
   if (reasoning_effort !== undefined) {
     body.params.reasoning_effort = reasoning_effort;
   }
-  if (tools && tools.length > 0) {
-    body.params.tools = tools.map(t => ({
-      type: t.type || 'function',
-      name: t.function?.name || t.name || '',
+  // CLI 始终下发 tools；空数组和缺键在 wire 上可观察。
+  body.params.tools = (tools || []).map(t => ({
+      name: toWireToolName(t.function?.name || t.name || ''),
       description: t.function?.description || t.description || '',
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
     }));
-  }
   if (tool_choice !== undefined) {
     // OpenAI 格式 → CC (Anthropic 风格) 格式
     if (typeof tool_choice === 'string') {
@@ -1274,6 +1348,23 @@ function buildCcRequest(openaiReq) {
   }
 
   return body;
+}
+
+const TOOL_NAME_ALIASES = {
+  bash_output: 'shell_output',
+  task_output: 'shell_output',
+  tool_search: 'search_tools',
+  read_multiple_files: 'read_file',
+};
+
+function toWireToolName(name) {
+  return TOOL_NAME_ALIASES[name] || name;
+}
+
+function toWireToolOutputValue(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.filter(part => part?.type === 'text').map(part => part.text ?? '').join('\n');
+  return content == null ? '' : String(content);
 }
 
 function tryParseJSON(str) {
@@ -1822,26 +1913,163 @@ async function getApiKey(headers) {
   return apiKey;
 }
 
+// ── 统一上游 HTTP 代理 ─────────────────────────────────
+// 所有 Command Code 请求必须使用同一出口，避免生成请求、设备初始化、
+// 用量和模型目录呈现不同来源 IP。代理凭据永不写入日志。
+const UPSTREAM_PROXY = CFG.upstreamProxy || '';
+const PROXY_CONNECT_TIMEOUT_MS = 15000;
+
+function redactProxyUrl(raw) {
+  if (!raw) return '(direct)';
+  try {
+    const url = new URL(raw);
+    return `${url.protocol}//${url.hostname}${url.port ? `:${url.port}` : ''}`;
+  } catch {
+    return '(invalid upstreamProxy)';
+  }
+}
+
+function parseProxyUrl(raw) {
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('upstreamProxy is not a valid URL (expected http://host:port)');
+  }
+  if (url.protocol !== 'http:') throw new Error(`upstreamProxy only supports http:// CONNECT proxies, got ${url.protocol}//`);
+  const port = Number.parseInt(url.port || '80', 10);
+  if (!url.hostname || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('upstreamProxy has an invalid host or port');
+  const auth = url.username
+    ? `Basic ${Buffer.from(`${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`).toString('base64')}`
+    : null;
+  return { host: url.hostname, port, auth };
+}
+
+if (UPSTREAM_PROXY) {
+  try {
+    parseProxyUrl(UPSTREAM_PROXY);
+  } catch (error) {
+    throw new Error(`[config] Invalid upstreamProxy (${redactProxyUrl(UPSTREAM_PROXY)}): ${error.message}`);
+  }
+}
+
+function headersToInit(rawHeaders) {
+  const headers = [];
+  for (const [name, value] of Object.entries(rawHeaders)) {
+    if (Array.isArray(value)) for (const item of value) headers.push([name, String(item)]);
+    else if (value !== undefined) headers.push([name, String(value)]);
+  }
+  return headers;
+}
+
+async function proxyFetch(urlString, options = {}) {
+  const proxy = parseProxyUrl(UPSTREAM_PROXY);
+  const url = new URL(urlString);
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('upstream request must use http or https');
+  const isTls = url.protocol === 'https:';
+  const port = Number.parseInt(url.port || (isTls ? '443' : '80'), 10);
+  const target = `${url.hostname}:${port}`;
+  const { signal, body } = options;
+  const onAbort = callback => {
+    if (!signal) return;
+    if (signal.aborted) callback();
+    else signal.addEventListener('abort', callback, { once: true });
+  };
+
+  const rawSocket = await new Promise((resolvePromise, reject) => {
+    const connectRequest = http.request({
+      host: proxy.host,
+      port: proxy.port,
+      method: 'CONNECT',
+      path: target,
+      headers: { Host: target, ...(proxy.auth ? { 'Proxy-Authorization': proxy.auth } : {}) },
+      timeout: PROXY_CONNECT_TIMEOUT_MS,
+    });
+    connectRequest.on('connect', (response, socket) => {
+      if (response.statusCode !== 200) {
+        socket.destroy();
+        reject(new Error(`upstream proxy CONNECT ${target} failed: HTTP ${response.statusCode}`));
+        return;
+      }
+      resolvePromise(socket);
+    });
+    connectRequest.on('timeout', () => connectRequest.destroy(new Error('upstream proxy CONNECT timeout')));
+    connectRequest.on('error', reject);
+    onAbort(() => connectRequest.destroy(new Error('request aborted')));
+    connectRequest.end();
+  });
+
+  let socket = rawSocket;
+  if (isTls) {
+    socket = tls.connect({ socket: rawSocket, servername: url.hostname });
+    await new Promise((resolvePromise, reject) => {
+      socket.once('secureConnect', resolvePromise);
+      socket.once('error', reject);
+      onAbort(() => socket.destroy(new Error('request aborted')));
+    });
+  }
+
+  return await new Promise((resolvePromise, reject) => {
+    const module = isTls ? https : http;
+    const request = module.request({
+      host: url.hostname,
+      port,
+      path: url.pathname + url.search,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+      createConnection: () => socket,
+    }, response => {
+      const nullBody = response.statusCode === 204 || response.statusCode === 205 || response.statusCode === 304;
+      if (nullBody) response.resume();
+      resolvePromise(new Response(nullBody ? null : Readable.toWeb(response), {
+        status: response.statusCode,
+        statusText: response.statusMessage,
+        headers: headersToInit(response.headers),
+      }));
+    });
+    request.on('error', reject);
+    onAbort(() => request.destroy(new Error('request aborted')));
+    if (body !== undefined && body !== null) request.write(body);
+    request.end();
+  });
+}
+
+function upstreamFetch(urlString, options) {
+  return UPSTREAM_PROXY ? proxyFetch(urlString, options) : fetch(urlString, options);
+}
+
 // ── 流式转发 ────────────────────────────────────────
 
-async function forwardToCC(body, apiKey, incomingHeaders = {}, signal) {
+async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
   const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
-  const sessionId = getSessionId(incomingHeaders, apiKey);
+  const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
 
-  const response = await fetch(url, {
+  // CLI 只在 session 是 UUID 时发送 threadId，并保持信封键顺序。
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(sessionId))) {
+    const ordered = {};
+    for (const key of ['config', 'memory', 'taste', 'skills', 'permissionMode']) ordered[key] = body[key];
+    ordered.threadId = sessionId;
+    for (const key of ['mode', 'promptCache', 'params']) if (key in body) ordered[key] = body[key];
+    body = ordered;
+  }
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': 'cli',
+    'x-command-code-version': CC_VERSION,
+    'x-cli-environment': 'production',
+    'x-project-slug': slugifyProjectPath(DEVICE_PROFILE.projectDir),
+    'x-taste-learning': 'false',
+    'x-session-id': sessionId,
+    'Authorization': `Bearer ${apiKey}`,
+    'traceparent': traceparent,
+  };
+  if (CFG.zdr || incomingHeaders['x-cmd-zdr'] === '1') headers['x-cmd-zdr'] = '1';
+
+  const response = await upstreamFetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-      'x-cli-environment': 'production',
-      'x-command-code-version': CC_VERSION,
-      'x-session-id': sessionId,
-      'x-co-flag': 'false',
-      'x-taste-learning': 'false',
-      'x-project-slug': fakeProjectSlug(sessionId),
-      'traceparent': traceparent,
-    },
+    headers,
     body: JSON.stringify(body),
     signal,
   });
@@ -1885,7 +2113,7 @@ async function handleChatCompletions(req, res) {
 
   try {
     // 账号池只在上游明确返回额度耗尽且尚未输出内容时切换；既有请求转换和流处理保持不变。
-    const upstream = await forwardWithPoolFailover(ccBody, apiKey, req.headers, abortController.signal);
+    const upstream = await forwardWithPoolFailover(ccBody, apiKey, req.headers, abortController.signal, openaiReq.prompt_cache_key);
     const ccResponse = upstream.response;
 
     if (!ccResponse.ok) {
@@ -2100,6 +2328,7 @@ async function handleChatCompletions(req, res) {
                 lastCcEvent = event.type;
                 log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
                 break;
+              case 'start': case 'start-step': case 'text-start': case 'reasoning-start': case 'finish-step':
               case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
                 // Silent - no user-visible content
                 break;
@@ -2230,7 +2459,7 @@ async function handleResponses(req, res) {
   let bytesReceived = 0;
 
   try {
-    const upstream = await forwardWithPoolFailover(ccBody, apiKey, req.headers, abortController.signal);
+    const upstream = await forwardWithPoolFailover(ccBody, apiKey, req.headers, abortController.signal, converted.chatRequest.prompt_cache_key);
     const ccResponse = upstream.response;
     if (!ccResponse?.ok) {
       const errorText = upstream.errorText ?? await ccResponse?.text().catch(() => '') ?? '';
@@ -2713,6 +2942,7 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
             break;
           }
 
+          case 'start': case 'start-step': case 'finish-step':
           case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
             // Silent - no user-visible content
             break;
@@ -2973,6 +3203,7 @@ async function handleMessages(req, res) {
                 lastCcEvent = event.type;
                 log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
                 break;
+              case 'start': case 'start-step': case 'text-start': case 'reasoning-start': case 'finish-step':
               case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
                 // Silent - no user-visible content
                 break;
@@ -3088,7 +3319,7 @@ async function fetchModels(apiKey, { force = false } = {}) {
 
   const refresh = (async () => {
     try {
-      const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
+      const response = await upstreamFetch(`${CFG.apiBase}/provider/v1/models`, {
         headers: {
           'Authorization': `Bearer ${catalogApiKey}`,
           'x-cli-environment': 'production',

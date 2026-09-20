@@ -54,12 +54,19 @@ commandcode/
 | `port` | `3000` | Listen port (repo config.json ships with `3050`) |
 | `host` | `0.0.0.0` | Listen address |
 | `apiBase` | `https://api.commandcode.ai` | CC API base URL |
-| `projectSlug` | `cc-proxy` | `x-project-slug` header |
+| `projectSlug` | `cc-proxy` | Legacy compatibility field; aligned requests derive `x-project-slug` from `deviceProjectDir` |
 | `apiKey` | `""` | Optional fallback API key (requests can also send it via header) |
 | `logFile` | `""` | Log file path (empty = console only) |
 | `logLevel` | `info` | Log level |
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `86400000` | Background model catalog refresh interval (24 hours; also syncs once at startup when a server-side key is available) |
+| `zdr` | `false` | Send `x-cmd-zdr: 1` on generation and initialization requests |
+| `cliMode` | `agent` | CLI-aligned request-envelope mode |
+| `cliSessionMode` | `interactive` | Lifecycle mode: `interactive` or `non-interactive` |
+| `fingerprintSalt` | `""` | Optional device-identity derivation salt; changing it presents every account as a new device |
+| `deviceProjectDir` | `""` | Shared device working directory/project slug source; empty uses the built-in Windows path |
+| `emptySystemPlaceholder` | `true` | Send a space when system is absent to prevent upstream default-prompt injection |
+| `upstreamProxy` | `""` | Optional HTTP CONNECT proxy shared by all CC calls; credentials are redacted from logs |
 
 ### Environment Variables
 
@@ -72,6 +79,15 @@ commandcode/
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
 | `CC_MODEL_REFRESH_INTERVAL_MS` | `modelRefreshIntervalMs` |
+| `CMD_ZDR` | `zdr` (`1` enables it) |
+| `CC_CLI_MODE` | `cliMode` |
+| `CC_CLI_SESSION_MODE` | `cliSessionMode` |
+| `CC_FINGERPRINT_SALT` | `fingerprintSalt` |
+| `CC_DEVICE_PROJECT_DIR` | `deviceProjectDir` |
+| `CC_EMPTY_SYSTEM_PLACEHOLDER` | `emptySystemPlaceholder` |
+| `CC_UPSTREAM_PROXY` | `upstreamProxy` |
+
+The compatibility layer declares the wire version it actually implements, `command-code@1.53.1`. A newer npm release produces a drift warning but never changes the advertised version before the request shape is aligned. Device fingerprints are derived deterministically per account, so restarts and multiple instances retain one identity without exposing the account key in the fingerprint, logs, or responses.
 
 ## API Endpoints
 

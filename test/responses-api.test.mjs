@@ -139,6 +139,7 @@ test('Responses API translates Codex 0.153 tools, input, output, and SSE lifecyc
     tool_choice: 'auto',
     parallel_tool_calls: false,
     reasoning: { effort: 'medium', context: 'all_turns' },
+    prompt_cache_key: 'd8d0ec66-62c7-4a9f-8106-cbb78bd9b5e4',
     store: false,
     stream: true,
     include: ['reasoning.encrypted_content'],
@@ -175,12 +176,16 @@ test('Responses API translates Codex 0.153 tools, input, output, and SSE lifecyc
   assert.equal(generatedBodies.length, 1);
   const ccBody = generatedBodies[0];
   assert.equal(ccBody.params.model, 'gpt-5.6-luna');
-  assert.equal(ccBody.params.system, 'You are Codex.');
+  assert.deepEqual(ccBody.params.system, [{ type: 'text', text: 'You are Codex.', cache_control: { type: 'ephemeral' } }]);
   assert.equal(ccBody.params.messages[0].content[0].text, 'Inspect the project.');
   assert.equal(ccBody.params.reasoning_effort, 'medium');
   assert.equal(ccBody.params.parallel_tool_calls, false);
-  assert.deepEqual(ccBody.params.tools.map(tool => [tool.type, tool.name]), [['function', 'functions__exec'], ['function', 'functions__wait']]);
+  assert.deepEqual(ccBody.params.tools.map(tool => [tool.type, tool.name]), [[undefined, 'functions__exec'], [undefined, 'functions__wait']]);
   assert.equal(ccBody.params.tools[0].input_schema.properties.input.type, 'string');
+  assert.equal(ccBody.skills, null);
+  assert.equal(ccBody.mode, 'agent');
+  assert.equal(ccBody.threadId, requestBody.prompt_cache_key);
+  assert.deepEqual(Object.keys(ccBody).slice(0, 8), ['config', 'memory', 'taste', 'skills', 'permissionMode', 'threadId', 'mode', 'params']);
 
   const secondResponse = await fetch(`${proxy.baseUrl}/v1/responses`, {
     method: 'POST',
@@ -195,11 +200,12 @@ test('Responses API translates Codex 0.153 tools, input, output, and SSE lifecyc
   const firstGenerateHeaders = generatedHeaders[0];
   assert.equal(firstGenerateHeaders.authorization, 'Bearer user_responses_test_key');
   assert.equal(firstGenerateHeaders['x-cli-environment'], 'production');
-  assert.ok(firstGenerateHeaders['x-command-code-version']);
-  assert.equal(firstGenerateHeaders['x-co-flag'], 'false');
+  assert.equal(firstGenerateHeaders['x-command-code-version'], '1.53.1');
+  assert.equal(firstGenerateHeaders['user-agent'], 'cli');
+  assert.equal(firstGenerateHeaders['x-co-flag'], undefined);
   assert.equal(firstGenerateHeaders['x-taste-learning'], 'false');
-  assert.match(firstGenerateHeaders['x-session-id'], /^[0-9a-f]{8}-[0-9a-f-]{27}$/i);
-  assert.match(firstGenerateHeaders['x-project-slug'], /^users-dev-projects-[a-z]+-[0-9a-f]{4}$/);
+  assert.equal(firstGenerateHeaders['x-session-id'], requestBody.prompt_cache_key);
+  assert.equal(firstGenerateHeaders['x-project-slug'], 'c-users-dev-projects-app');
   assert.match(firstGenerateHeaders.traceparent, /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
   assert.equal(generatedHeaders[1]['x-session-id'], firstGenerateHeaders['x-session-id'], 'same key must reuse its CLI session');
   assert.equal(generatedHeaders[1]['x-project-slug'], firstGenerateHeaders['x-project-slug']);
@@ -314,7 +320,7 @@ test('installed Codex CLI completes a custom-tool round trip through /v1/respons
     generatedBodies.push(body);
     if (generatedBodies.length === 1) {
       const execTool = body.params.tools?.find(tool => /exec$/i.test(tool.name));
-      assert.equal(execTool?.type, 'function');
+      assert.equal(execTool?.type, undefined);
       sendNdjson(res, [
         { type: 'tool-call', toolCallId: 'call_e2e_probe', toolName: execTool.name, input: { input: 'text("PROBE_TOOL_OK")' } },
         { type: 'finish', finishReason: 'tool-calls', totalUsage: { inputTokens: 10, outputTokens: 5, cachedInputTokens: 0 } },
