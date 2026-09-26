@@ -357,6 +357,8 @@ curl 'http://127.0.0.1:3050/usage?format=json'
 
 代理启动时会同步一次 Provider 实时模型目录，之后默认每 24 小时在后台同步。如果尚未配置服务端账号，第一次携带有效 Key 的 API 请求会在内存中为后续后台刷新提供凭据。以下仅为常见离线兜底模型，完整列表以实时接口返回为准——各模型套餐可参考 [Command Code Pricing](https://commandcode.ai/docs/resources/pricing-limits)。
 
+部分 harness 会把上下文窗口标签附加到模型名末尾，例如 `deepseek/deepseek-v4-flash [1M]`。代理只在转发上游时移除末尾精确的 `[1M]` 标签；返回给客户端的模型名仍保持原值，模型名中间出现的相似文本不会被改写。
+
 ### 常用模型
 
 | 模型 ID | 提供商 |

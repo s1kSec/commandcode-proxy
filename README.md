@@ -291,6 +291,8 @@ Health check. Returns `OK`.
 
 The proxy synchronizes the live Provider catalog once at startup and then every 24 hours by default. If no server-side key has been configured yet, the first authenticated API request supplies one in memory for later background refreshes. Below are common offline fallback models; the actual list depends on the live API response — see [Command Code Pricing](https://commandcode.ai/docs/resources/pricing-limits) for plan details.
 
+Some harnesses append a context-window label to the model name, for example `deepseek/deepseek-v4-flash [1M]`. The proxy removes only an exact terminal `[1M]` marker when forwarding upstream, while preserving the original model label in downstream responses. Similar text embedded inside a model ID is never rewritten.
+
 ### Common Models
 
 | Model ID | Provider |

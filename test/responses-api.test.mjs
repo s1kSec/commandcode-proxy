@@ -118,7 +118,7 @@ test('Responses API translates Codex 0.153 tools, input, output, and SSE lifecyc
   t.after(() => proxy.close());
 
   const requestBody = {
-    model: 'gpt-5.6-luna',
+    model: 'gpt-5.6-luna [1M]',
     input: [
       {
         type: 'additional_tools',
@@ -169,13 +169,14 @@ test('Responses API translates Codex 0.153 tools, input, output, and SSE lifecyc
   });
   const completed = events.at(-1);
   assert.equal(completed.type, 'response.completed');
+  assert.equal(completed.response.model, 'gpt-5.6-luna [1M]', 'downstream response keeps the harness model label');
   assert.equal(completed.response.usage.input_tokens, 20);
   assert.equal(completed.response.usage.input_tokens_details.cached_tokens, 3);
   assert.equal(completed.response.usage.output_tokens, 8);
 
   assert.equal(generatedBodies.length, 1);
   const ccBody = generatedBodies[0];
-  assert.equal(ccBody.params.model, 'gpt-5.6-luna');
+  assert.equal(ccBody.params.model, 'gpt-5.6-luna', 'upstream receives the provider model ID without the terminal [1M] annotation');
   assert.deepEqual(ccBody.params.system, [{ type: 'text', text: 'You are Codex.', cache_control: { type: 'ephemeral' } }]);
   assert.equal(ccBody.params.messages[0].content[0].text, 'Inspect the project.');
   assert.equal(ccBody.params.reasoning_effort, 'medium');

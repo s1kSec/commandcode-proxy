@@ -1192,6 +1192,15 @@ function convertResponsesRequest(responsesReq) {
   };
 }
 
+function normalizeUpstreamModelId(model) {
+  if (typeof model !== 'string' || model.length === 0) return model;
+  // Some harnesses append a context-window annotation to the selected model.
+  // It is client metadata, not part of Command Code's provider model ID. Only
+  // remove one exact terminal marker; never rewrite embedded or similar text.
+  const normalized = model.replace(/[ \t]*\[1M\][ \t]*$/i, '').trimEnd();
+  return normalized || model;
+}
+
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
@@ -1309,7 +1318,7 @@ function buildCcRequest(openaiReq) {
     permissionMode: 'standard',
     mode: CFG.cliMode,
     params: {
-      model: model || 'deepseek/deepseek-v4-flash',
+      model: normalizeUpstreamModelId(model || 'deepseek/deepseek-v4-flash'),
       messages: ccMessages,
       max_tokens: Math.min(max_tokens || 64000, 200000),
       stream: true,  // CC API 总是 stream
