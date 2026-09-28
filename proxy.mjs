@@ -859,9 +859,17 @@ function extractResetAt(value) {
 
 function isQuotaExhaustedResponse(status, body) {
   if (status === 402) return true;
-  if (status !== 429) return false;
+  if (status !== 400 && status !== 429) return false;
   let parsed = null;
   try { parsed = JSON.parse(body); } catch {}
+  if (status === 400) {
+    // Only explicit credit exhaustion is retryable on 400. Inspect the error
+    // message, not echoed request fields or generic quota/parameter errors.
+    const message = parsed === null ? body
+      : typeof parsed === 'string' ? parsed
+      : parsed?.error?.message ?? parsed?.message ?? parsed?.error;
+    return typeof message === 'string' && /\binsufficient\s+credits\b/i.test(message);
+  }
   if (parsed?.error?.rateLimit || parsed?.rateLimit) return true;
   const message = typeof body === 'string' ? body : '';
   return /(?:5[- ]?hour|weekly|monthly)\s+(?:usage\s+)?(?:limit|quota)|usage\s+limit|insufficient\s+credits|credit\s+(?:balance|limit)/i.test(message);
