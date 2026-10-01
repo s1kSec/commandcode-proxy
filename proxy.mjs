@@ -2599,7 +2599,7 @@ async function handleResponses(req, res) {
 // ── Anthropic /v1/messages 协议转换 ─────────────────
 
 function mapAnthropicStopReason(finishReason) {
-  switch (finishReason) {
+  switch (mapFinishReason(finishReason)) {
     case 'tool_calls': return 'tool_use';
     case 'length': return 'max_tokens';
     case 'stop': return 'end_turn';
@@ -2711,9 +2711,9 @@ function convertAnthropicToOpenAI(anthropicReq) {
           }
         }
       }
-      if (textContent) {
-        openaiMessages.push({ role: 'user', content: textContent });
-      }
+      // Resolve the assistant tool calls before appending any user text.
+      // Claude can combine tool_result blocks and skill/system reminders in
+      // one user message; interleaving text makes the upstream return empty.
       for (const tr of toolResults) {
         const toolContent = typeof tr.content === 'string' ? tr.content
           : Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('')
@@ -2724,6 +2724,9 @@ function convertAnthropicToOpenAI(anthropicReq) {
           name: toolNameFromId[tr.tool_use_id] || '',
           content: toolContent,
         });
+      }
+      if (textContent) {
+        openaiMessages.push({ role: 'user', content: textContent });
       }
     }
   }
